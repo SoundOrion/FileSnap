@@ -1,0 +1,359 @@
+できます。
+`.NET Generic Host`で**共有スナップショット**をシングルトンに持たせ、
+
+* **Worker #1**（`BackgroundService`）= スナップショットを定期更新
+* **Worker #2**（`BackgroundService`）= TCP待受け・クライアントから受け取った状態とサーバ側スナップショットを比較して差分応答
+
+という構成にすればOKです。下に**そのまま動く最小構成**を置きます（.NET 8 / コンソール）。
+
+---
+
+# サンプル構成（単一 `Program.cs`）
+
+* ポート: `5001`（必要に応じて変更）
+* プロトコル: **JSON一発**
+  クライアント→サーバ：`ClientSnapshot`（クライアントが持つ圧縮ファイルの {path, size, modifiedUtc, sha256Hex} の配列）
+  サーバ→クライアント：差分 `{toDownload[], toDelete[], upToDate[]}` を返す
+* スナップショット: **サーバ側の圧縮ファイル**を監視し、`SHA256`で内容変更検知
+
+> ※「圧縮ファイルかどうか」は問わずに全ファイルにしています。特定拡張子だけ対象にしたい場合は EnumerateFiles の結果を filter してください。
+
+```csharp
+using System.Collections.Immutable;
+using System.Net;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+
+// ========== モデル & 共有インデックス ==========
+public sealed record ArchiveInfo(
+    string FilePath,
+    long Size,
+    DateTimeOffset ModifiedUtc,
+    byte[] Hash // SHA256 (binary)
+);
+
+public interface IFileIndex
+{
+    ImmutableDictionary<string, ArchiveInfo> Snapshot { get; }
+    void Replace(ImmutableDictionary<string, ArchiveInfo> next);
+}
+
+public sealed class InMemoryFileIndex : IFileIndex
+{
+    private ImmutableDictionary<string, ArchiveInfo> _snap
+        = ImmutableDictionary<string, ArchiveInfo>.Empty.WithComparers(StringComparer.OrdinalIgnoreCase);
+
+    public ImmutableDictionary<string, ArchiveInfo> Snapshot
+        => System.Threading.Volatile.Read(ref _snap);
+
+    public void Replace(ImmutableDictionary<string, ArchiveInfo> next)
+        => System.Threading.Interlocked.Exchange(ref _snap, next);
+}
+
+// ========== Worker #1: スナップショット更新 ==========
+public sealed class SnapshotWorker : BackgroundService
+{
+    private readonly ILogger<SnapshotWorker> _logger;
+    private readonly IFileIndex _index;
+
+    // 設定
+    private readonly string _folder = @"D:\data";                 // 監視フォルダ
+    private readonly TimeSpan _period = TimeSpan.FromSeconds(30); // 周期
+    private readonly bool _recurse = false;                       // サブフォルダ再帰
+
+    public SnapshotWorker(ILogger<SnapshotWorker> logger, IFileIndex index)
+    {
+        _logger = logger;
+        _index = index;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        _logger.LogInformation("SnapshotWorker started. Folder={Folder}, Period={Period}", _folder, _period);
+
+        // 初回
+        await BuildAndSwapAsync(stoppingToken);
+
+        using var timer = new PeriodicTimer(_period);
+        while (await timer.WaitForNextTickAsync(stoppingToken))
+        {
+            try { await BuildAndSwapAsync(stoppingToken); }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex) { _logger.LogWarning(ex, "Snapshot update failed"); }
+        }
+    }
+
+    private async Task BuildAndSwapAsync(CancellationToken ct)
+    {
+        var option = _recurse ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+        var files = Directory.EnumerateFiles(_folder, "*.*", option);
+
+        var bag = new System.Collections.Concurrent.ConcurrentBag<ArchiveInfo>();
+        var po = new ParallelOptions { CancellationToken = ct, MaxDegreeOfParallelism = Environment.ProcessorCount };
+
+        await Task.Run(() =>
+        {
+            Parallel.ForEach(files, po, path =>
+            {
+                try
+                {
+                    var fi = new FileInfo(path);
+                    if (!fi.Exists) return;
+
+                    using var fs = fi.Open(FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                    using var sha = SHA256.Create();
+                    var hash = sha.ComputeHash(fs);
+
+                    bag.Add(new ArchiveInfo(
+                        FilePath: path,
+                        Size: fi.Length,
+                        ModifiedUtc: fi.LastWriteTimeUtc,
+                        Hash: hash
+                    ));
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Skip unreadable file: {Path}", path);
+                }
+            });
+        }, ct);
+
+        var builder = ImmutableDictionary.CreateBuilder<string, ArchiveInfo>(StringComparer.OrdinalIgnoreCase);
+        foreach (var ai in bag) builder[ai.FilePath] = ai;
+
+        _index.Replace(builder.ToImmutable());
+        _logger.LogInformation("Snapshot updated: {Count} files", builder.Count);
+    }
+}
+
+// ========== Worker #2: TCPサーバ ==========
+public sealed class TcpServerWorker : BackgroundService
+{
+    private readonly ILogger<TcpServerWorker> _logger;
+    private readonly IFileIndex _index;
+    private readonly int _port = 5001;
+
+    public TcpServerWorker(ILogger<TcpServerWorker> logger, IFileIndex index)
+    {
+        _logger = logger;
+        _index = index;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        var listener = new TcpListener(IPAddress.Any, _port);
+        listener.Start();
+        _logger.LogInformation("TCP server listening on {Port}", _port);
+
+        try
+        {
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                var client = await listener.AcceptTcpClientAsync(stoppingToken);
+                _ = HandleClientAsync(client, stoppingToken); // 投げっぱなしタスク
+            }
+        }
+        catch (OperationCanceledException) { /* graceful stop */ }
+        finally { listener.Stop(); }
+    }
+
+    private async Task HandleClientAsync(TcpClient client, CancellationToken ct)
+    {
+        await using var _ = client;
+        client.NoDelay = true;
+
+        var ep = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
+        _logger.LogInformation("Client connected: {EP}", ep);
+
+        try
+        {
+            using var ns = client.GetStream();
+            using var reader = new StreamReader(ns, Encoding.UTF8, leaveOpen: true);
+            using var writer = new StreamWriter(ns, new UTF8Encoding(false)) { AutoFlush = true };
+
+            // 1) 1行 JSON を受信（クライアント側のスナップショット）
+            var line = await reader.ReadLineAsync(ct);
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                await writer.WriteLineAsync("{\"error\":\"empty payload\"}");
+                return;
+            }
+
+            var clientSnap = JsonSerializer.Deserialize<ClientSnapshot>(line!, JsonOptions()) ?? new ClientSnapshot();
+
+            // 2) サーバ側スナップショットと差分計算
+            var server = _index.Snapshot;
+
+            // 辞書化
+            var clientMap = clientSnap.Files?.ToDictionary(
+                f => f.FilePath, f => f, StringComparer.OrdinalIgnoreCase
+            ) ?? new Dictionary<string, ClientFileInfo>(StringComparer.OrdinalIgnoreCase);
+
+            var toDownload = new List<string>(); // サーバが新しい or クライアントに無い → クライアントはダウンロード
+            var toDelete   = new List<string>(); // サーバに無い → クライアントは削除
+            var upToDate   = new List<string>(); // 同一
+
+            // サーバ視点
+            foreach (var (path, s) in server)
+            {
+                if (!clientMap.TryGetValue(path, out var c))
+                {
+                    toDownload.Add(path);
+                }
+                else
+                {
+                    if (HashesEqual(s.Hash, c.Sha256Hex))
+                        upToDate.Add(path);
+                    else
+                        toDownload.Add(path); // サーバ版で更新
+                }
+            }
+
+            // クライアントにあってサーバにない
+            foreach (var (path, _) in clientMap)
+            {
+                if (!server.ContainsKey(path))
+                    toDelete.Add(path);
+            }
+
+            var resp = new ServerDiffResponse
+            {
+                ToDownload = toDownload,
+                ToDelete = toDelete,
+                UpToDate = upToDate
+            };
+
+            // 3) 応答
+            var json = JsonSerializer.Serialize(resp, JsonOptions());
+            await writer.WriteLineAsync(json);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Client error: {EP}", ep);
+        }
+        finally
+        {
+            _logger.LogInformation("Client disconnected: {EP}", ep);
+        }
+    }
+
+    private static bool HashesEqual(byte[] serverHash, string? clientHex)
+    {
+        if (string.IsNullOrWhiteSpace(clientHex)) return false;
+        try
+        {
+            var span = clientHex.AsSpan();
+            if (span.Length != 64) return false; // SHA256 = 32 bytes = 64 hex chars
+            Span<byte> buf = stackalloc byte[32];
+            for (int i = 0; i < 32; i++)
+            {
+                buf[i] = Convert.ToByte(new string(new[] { (char)span[i * 2], (char)span[i * 2 + 1] }), 16);
+            }
+            return serverHash.AsSpan().SequenceEqual(buf);
+        }
+        catch { return false; }
+    }
+
+    private static JsonSerializerOptions JsonOptions() => new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        WriteIndented = false
+    };
+}
+
+// ========== クライアント⇔サーバのDTO ==========
+public sealed class ClientSnapshot
+{
+    public List<ClientFileInfo>? Files { get; set; }
+}
+public sealed class ClientFileInfo
+{
+    public string FilePath { get; set; } = "";
+    public long Size { get; set; }
+    public DateTimeOffset ModifiedUtc { get; set; }
+    public string? Sha256Hex { get; set; } // クライアント側で計算したハッシュ（16進文字列）
+}
+public sealed class ServerDiffResponse
+{
+    public List<string> ToDownload { get; set; } = new();
+    public List<string> ToDelete { get; set; } = new();
+    public List<string> UpToDate { get; set; } = new();
+}
+
+// ========== ホスト起動 ==========
+public class Program
+{
+    public static async Task Main(string[] args)
+    {
+        using var host = Host.CreateDefaultBuilder(args)
+            .ConfigureLogging(b => b.SetMinimumLevel(LogLevel.Information))
+            .ConfigureServices(services =>
+            {
+                services.AddSingleton<IFileIndex, InMemoryFileIndex>();
+                services.AddHostedService<SnapshotWorker>(); // 1つ目: スナップショット更新
+                services.AddHostedService<TcpServerWorker>(); // 2つ目: TCPサーバ
+            })
+            .Build();
+
+        await host.RunAsync();
+    }
+}
+```
+
+---
+
+## 使い方（サーバ）
+
+```bash
+dotnet new console -n DualWorkers
+cd DualWorkers
+# 上記を Program.cs に貼る
+dotnet run
+```
+
+* `SnapshotWorker` が `D:\data` を30秒毎にスキャンしてスナップショット更新
+* `TcpServerWorker` が `:5001` で待受け
+
+> 監視フォルダや周期、ポートはコード先頭の設定を変更してください。
+
+---
+
+## クライアントからの呼び出し例（テスト用・簡易）
+
+```bash
+# 例: WindowsのPowerShellで、適当なJSONを1行で送信
+$payload='{"files":[{"filePath":"D:\\data\\pack1.zip","size":123,"modifiedUtc":"2025-10-09T12:00:00Z","sha256Hex":"<計算した64桁hex>"}]}'
+$client = New-Object System.Net.Sockets.TcpClient("127.0.0.1",5001)
+$stream = $client.GetStream()
+$writer = New-Object System.IO.StreamWriter($stream,[System.Text.UTF8Encoding]::new($false))
+$reader = New-Object System.IO.StreamReader($stream,[System.Text.UTF8Encoding]::UTF8)
+$writer.AutoFlush = $true
+$writer.WriteLine($payload)
+$resp = $reader.ReadLine()
+$resp
+$client.Close()
+```
+
+※ 実運用では**クライアント側で SHA256 を計算**して `sha256Hex` を埋めて送ります。
+（サーバ側の `HashesEqual` が `serverHash` とこの16進文字列を比較）
+
+---
+
+## 追加の実装ヒント
+
+* **フォーマットの厳格化**：コマンド種別を増やす場合は `{"cmd":"diff","payload":{...}}` の形にすると拡張しやすいです。
+* **大きな応答**：行単位ではなく `length-prefix` プロトコル（先頭にバイト長を書いて本体を送る）にすると安全です。
+* **圧縮ファイルだけ対象**：`EnumerateFiles()` のあとに `.Where(p => p.EndsWith(".zip", ... ) || p.EndsWith(".zipself", ...))` などで絞り込む。
+* **権限/ロック**：`FileShare.ReadWrite | FileShare.Delete` を指定済み。うまく読めないファイルはスキップ。
+* **スナップショットのスナップショット**：読み取り側（TCP側）は `IFileIndex.Snapshot` を読むだけなのでロック不要で安全。
+
+この形なら、**BackgroundService を2つ**並走させてご希望の動作を綺麗に分離できます。
+もし「差分に応じてファイル送付まで行う」などプロトコルを拡張したい場合は、その仕様を書いていただければサーバ/クライアント両方の雛形を整えます。
