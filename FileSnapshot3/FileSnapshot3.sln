@@ -5,6 +5,8 @@ VisualStudioVersion = 17.14.36408.4 d17.14
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FileSnapshot3", "FileSnapshot3\FileSnapshot3.csproj", "{2CAA5427-8951-4321-BAD8-93154AABF1C9}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FileSnapshot3.Client", "FileSnapshot3.Client\FileSnapshot3.Client.csproj", "{003DFAD9-620C-44EA-8F42-FFE0D671C81B}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -15,6 +17,10 @@ Global
 		{2CAA5427-8951-4321-BAD8-93154AABF1C9}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{2CAA5427-8951-4321-BAD8-93154AABF1C9}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{2CAA5427-8951-4321-BAD8-93154AABF1C9}.Release|Any CPU.Build.0 = Release|Any CPU
+		{003DFAD9-620C-44EA-8F42-FFE0D671C81B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{003DFAD9-620C-44EA-8F42-FFE0D671C81B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{003DFAD9-620C-44EA-8F42-FFE0D671C81B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{003DFAD9-620C-44EA-8F42-FFE0D671C81B}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
