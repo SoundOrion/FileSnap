@@ -455,3 +455,132 @@ private static bool HashesEqual(byte[] serverHash, string? clientHex)
 > サーバ側で「クライアントのZIP群」と「自分のZIP群」を比較して、
 > どのファイルが“追加”“削除”“更新”されたかを自動で見つける判定処理です。
 
+
+うん、**できます。**
+通信のフォーマットを JSON にするのは便利なだけで、必須ではありません。
+クライアントとサーバの両方がルールを共有していれば、
+**ただの文字列プロトコル（テキストベース）**でも問題ありません。
+
+---
+
+## 🔹どう変わるか
+
+いまは例えば：
+
+```json
+{
+  "files": [ { "archiveName": "a.zip", "sha256Hex": "ABCDEF..." } ],
+  "bundleMissingAsZip": true
+}
+```
+
+という JSON を送って、サーバは `JsonSerializer.Deserialize<ClientSyncRequest>` でパースしています。
+これを “独自文字列” に変えるなら、単に決め打ちの形式にすればOKです。
+
+---
+
+## ✅ 例：シンプルな文字列プロトコル
+
+### クライアント → サーバ
+
+```
+SYNC|a.zip,ABCDEF1234567890;config.zip,0123456789ABCDEF
+```
+
+* `SYNC` がコマンド
+* 各ファイルは `名前,ハッシュ` のペア
+* 複数ファイルは `;` 区切り
+
+サーバ側でこう受け取る：
+
+```csharp
+private ClientSyncRequest ParseCommand(string line)
+{
+    if (!line.StartsWith("SYNC|", StringComparison.OrdinalIgnoreCase))
+        throw new InvalidOperationException("Unknown command");
+
+    var list = new List<ClientFileInfo>();
+    var body = line.Substring(5); // "a.zip,ABCDEF;config.zip,01234..."
+    foreach (var pair in body.Split(';', StringSplitOptions.RemoveEmptyEntries))
+    {
+        var parts = pair.Split(',', 2);
+        if (parts.Length < 2) continue;
+        list.Add(new ClientFileInfo
+        {
+            ArchiveName = parts[0].Trim(),
+            Sha256Hex   = parts[1].Trim()
+        });
+    }
+    return new ClientSyncRequest { Files = list };
+}
+```
+
+---
+
+### サーバ → クライアント（結果返却）
+
+```
+RESULT|DOWNLOAD:a.zip,b.zip;DELETE:old.zip;OK:config.zip
+```
+
+クライアント側でパース：
+
+```csharp
+private ServerSyncResult ParseResult(string line)
+{
+    if (!line.StartsWith("RESULT|", StringComparison.OrdinalIgnoreCase))
+        throw new InvalidOperationException("Invalid response");
+
+    var res = new ServerSyncResult();
+    var body = line.Substring(7);
+    var parts = body.Split(';', StringSplitOptions.RemoveEmptyEntries);
+
+    foreach (var p in parts)
+    {
+        var kv = p.Split(':', 2);
+        if (kv.Length < 2) continue;
+
+        var key = kv[0].Trim().ToUpperInvariant();
+        var files = kv[1].Split(',', StringSplitOptions.RemoveEmptyEntries).ToList();
+
+        switch (key)
+        {
+            case "DOWNLOAD": res.ToDownload = files; break;
+            case "DELETE":   res.ToDelete   = files; break;
+            case "OK":       res.UpToDate   = files; break;
+        }
+    }
+    return res;
+}
+```
+
+---
+
+## 💡 メリットとデメリット
+
+| 項目          | JSON                  | 独自文字列             |
+| ----------- | --------------------- | ----------------- |
+| **可読性**     | 高い（人間も読める）            | 設計次第              |
+| **柔軟性**     | 高い（構造を増やせる）           | 拡張が難しい            |
+| **速度/サイズ**  | 若干重い                  | 軽い（オーバーヘッド小）      |
+| **実装**      | `System.Text.Json` 一発 | 自前でSplit/Parseが必要 |
+| **バージョン管理** | Schemaで管理可            | 非構造的なので面倒         |
+
+---
+
+## 🔸おすすめ判断
+
+* **軽量・高速にしたいローカル専用同期ツール**
+  　→ 独自文字列で十分。
+
+* **構造を拡張していく予定（追加フィールドなど）**
+  　→ JSON のままが安全。
+
+---
+
+🟢 **結論：**
+
+> JSON は“手軽な構造化フォーマット”なだけで必須ではない。
+> ファイル名・ハッシュ・コマンドなどが単純なら、
+> 文字列プロトコルで送受信して全く問題ありません。
+
