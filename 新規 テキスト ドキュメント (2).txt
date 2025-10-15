@@ -584,3 +584,194 @@ private ServerSyncResult ParseResult(string line)
 > ファイル名・ハッシュ・コマンドなどが単純なら、
 > 文字列プロトコルで送受信して全く問題ありません。
 
+
+
+
+
+
+
+
+OK 👍　
+ではこのクライアントコードを **JSON ではなく “シンプルな文字列プロトコル” で送受信** する形に書き換えます。
+（サーバも同じルールでパースする必要があります）
+
+---
+
+## 🎯 方針（シンプルな文字列フォーマット）
+
+### クライアント → サーバ
+
+```
+SYNC|a.zip,ABCDEF1234;config.zip,7890ABCD;...
+```
+
+* `SYNC|` … コマンド識別子
+* `;` … ファイルごとの区切り
+* `,` … ファイル名とハッシュの区切り
+
+### サーバ → クライアント
+
+```
+RESULT|DOWNLOAD:a.zip,b.zip;DELETE:old.zip;OK:config.zip
+```
+
+---
+
+## 💻 修正版クライアントコード（文字列送信版）
+
+```csharp
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
+
+// ====== 設定 ======
+string targetFolder = args.FirstOrDefault() ?? @"C:\";
+string serverHost = "127.0.0.1";
+int serverPort = 5001;
+
+int maxDegreeOfParallelism = Environment.ProcessorCount;
+
+Console.WriteLine($"[Client] Building snapshot of '{targetFolder}' ...");
+
+// 1) スナップショット構築
+var files = Directory.EnumerateFiles(targetFolder, "*.zip", SearchOption.TopDirectoryOnly);
+var bag = new System.Collections.Concurrent.ConcurrentBag<(string Name, string Hash)>();
+
+Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = maxDegreeOfParallelism }, path =>
+{
+    try
+    {
+        var fi = new FileInfo(path);
+        if (!fi.Exists) return;
+
+        using var fs = fi.Open(FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var sha = SHA256.Create();
+        var hash = sha.ComputeHash(fs);
+        var hex = Convert.ToHexString(hash).ToLowerInvariant();
+
+        bag.Add((fi.Name, hex));
+    }
+    catch { /* 読み込みエラーはスキップ */ }
+});
+
+Console.WriteLine($"[Client] Files: {bag.Count}");
+
+// 2) プロトコル文字列を組み立てる
+//    例: "SYNC|a.zip,abc123;config.zip,def456"
+var sb = new StringBuilder();
+sb.Append("SYNC|");
+sb.Append(string.Join(';', bag.Select(f => $"{f.Name},{f.Hash}")));
+var message = sb.ToString();
+
+// 3) サーバへ送信して結果を受信
+Console.WriteLine($"[Client] Connecting {serverHost}:{serverPort} ...");
+using var client = new TcpClient();
+await client.ConnectAsync(serverHost, serverPort);
+using var ns = client.GetStream();
+using var writer = new StreamWriter(ns, new UTF8Encoding(false)) { AutoFlush = true };
+using var reader = new StreamReader(ns, Encoding.UTF8);
+
+await writer.WriteLineAsync(message);
+Console.WriteLine("[Client] Sent snapshot data.");
+
+var line = await reader.ReadLineAsync();
+if (string.IsNullOrWhiteSpace(line))
+{
+    Console.WriteLine("[Client] Empty response.");
+    return;
+}
+
+Console.WriteLine($"\n[Client] Response: {line}");
+ParseAndDisplay(line);
+
+Console.ReadLine();
+
+// ====== レスポンス解析 ======
+static void ParseAndDisplay(string line)
+{
+    if (!line.StartsWith("RESULT|", StringComparison.OrdinalIgnoreCase))
+    {
+        Console.WriteLine("Invalid response format");
+        return;
+    }
+
+    var body = line.Substring(7);
+    var parts = body.Split(';', StringSplitOptions.RemoveEmptyEntries);
+
+    var toDownload = new List<string>();
+    var toDelete = new List<string>();
+    var upToDate = new List<string>();
+
+    foreach (var p in parts)
+    {
+        var kv = p.Split(':', 2);
+        if (kv.Length < 2) continue;
+
+        var key = kv[0].Trim().ToUpperInvariant();
+        var files = kv[1].Split(',', StringSplitOptions.RemoveEmptyEntries).ToList();
+
+        switch (key)
+        {
+            case "DOWNLOAD": toDownload.AddRange(files); break;
+            case "DELETE": toDelete.AddRange(files); break;
+            case "OK": upToDate.AddRange(files); break;
+        }
+    }
+
+    PrintList("ToDownload (server newer/missing)", toDownload);
+    PrintList("ToDelete   (not present on server)", toDelete);
+    PrintList("UpToDate   (same content)", upToDate);
+}
+
+static void PrintList(string title, List<string>? list)
+{
+    list ??= new();
+    Console.WriteLine($"\n[{title}] ({list.Count})");
+    foreach (var p in list) Console.WriteLine(" - " + p);
+}
+```
+
+---
+
+## ⚙️ サーバ側の受信例（簡略版）
+
+サーバ側の `HandleClientAsync` はこんな感じで受け取ります：
+
+```csharp
+var line = await reader.ReadLineAsync(ct);
+if (line?.StartsWith("SYNC|", StringComparison.OrdinalIgnoreCase) == true)
+{
+    var body = line.Substring(5);
+    var files = body.Split(';', StringSplitOptions.RemoveEmptyEntries)
+                    .Select(pair =>
+                    {
+                        var parts = pair.Split(',', 2);
+                        return new ClientFileInfo { ArchiveName = parts[0], Sha256Hex = parts.ElementAtOrDefault(1) };
+                    })
+                    .ToList();
+
+    var req = new ClientSyncRequest { Files = files };
+    // あとは従来通り差分計算へ
+}
+```
+
+---
+
+## 💡 まとめ
+
+| 項目         | JSON版             | 文字列版         |                           |
+| ---------- | ----------------- | ------------ | ------------------------- |
+| **フォーマット** | 構造化(JSON)         | 軽量テキスト       |                           |
+| **送信例**    | `{"files":[...]}` | `SYNC        | a.zip,abc;config.zip,def` |
+| **サイズ**    | 大                 | 小（約30〜50%減）  |                           |
+| **柔軟性**    | 高い（構造増やせる）        | 固定フォーマットだが高速 |                           |
+| **推奨用途**   | 拡張を見越すとき          | 内部ツール・軽量通信   |                           |
+
+---
+
+🟢 **結論：**
+
+> 上のコードで、JSONではなく `"SYNC|..."` 形式の単純な文字列として
+> クライアント→サーバ通信が可能になります。
+> サーバ側も `StartsWith("SYNC|")` で受け取り、`;` と `,` で分割すればOKです。
+
