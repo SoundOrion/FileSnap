@@ -1,0 +1,378 @@
+了解です 👍
+以下は `.NET 8` 向けの完全な `SnapshotWorker` クラスの最新版です。
+このバージョンでは：
+
+* 検索パターンを `var pattern = "*.zip";` のように変更可能
+* 非同期 (`await Parallel.ForEachAsync`) で並列ハッシュ計算
+* `FileName`（＝`fi.Name`）をキーにした `ImmutableDictionary` を構築
+* 辞書の衝突時は更新日時が新しいファイルを優先
+* `Task.Run` は一切使っていません
+
+---
+
+```csharp
+using System.Collections.Immutable;
+using System.IO.Compression;
+using System.Security.Cryptography;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+
+public sealed record ArchiveInfo(
+    string ArchiveName,     // アーカイブ名（キー）
+    string FilePath,        // 実パス
+    long Size,
+    DateTimeOffset ModifiedUtc,
+    byte[] Hash
+);
+
+public interface IFileIndex
+{
+    ImmutableDictionary<string, ArchiveInfo> Snapshot { get; }
+    void Replace(ImmutableDictionary<string, ArchiveInfo> next);
+}
+
+public sealed class InMemoryFileIndex : IFileIndex
+{
+    private ImmutableDictionary<string, ArchiveInfo> _snap =
+        ImmutableDictionary<string, ArchiveInfo>.Empty.WithComparers(StringComparer.OrdinalIgnoreCase);
+
+    public ImmutableDictionary<string, ArchiveInfo> Snapshot =>
+        System.Threading.Volatile.Read(ref _snap);
+
+    public void Replace(ImmutableDictionary<string, ArchiveInfo> next) =>
+        System.Threading.Interlocked.Exchange(ref _snap, next);
+}
+
+/// <summary>
+/// 指定フォルダ内のZIP（など）を定期スキャンしてスナップショットを更新する
+/// </summary>
+public sealed class SnapshotWorker : BackgroundService
+{
+    private readonly ILogger<SnapshotWorker> _log;
+    private readonly IFileIndex _index;
+
+    private readonly string _folder = @"D:\data";           // 監視フォルダ
+    private readonly string _pattern = "*.zip";             // 対象パターン（例: "*.zipself" 等）
+    private readonly bool _recurse = false;                 // サブフォルダ再帰探索するか
+    private readonly TimeSpan _period = TimeSpan.FromSeconds(30);
+
+    public SnapshotWorker(ILogger<SnapshotWorker> log, IFileIndex index)
+    {
+        _log = log;
+        _index = index;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        // 初回スキャン
+        await BuildAndSwapAsync(stoppingToken);
+
+        using var timer = new PeriodicTimer(_period);
+        while (await timer.WaitForNextTickAsync(stoppingToken))
+        {
+            try
+            {
+                await BuildAndSwapAsync(stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Snapshot update failed");
+            }
+        }
+    }
+
+    /// <summary>
+    /// 対象フォルダをスキャンしてスナップショットを再構築する
+    /// </summary>
+    private async Task BuildAndSwapAsync(CancellationToken ct)
+    {
+        var option = _recurse ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+        var files = Directory.EnumerateFiles(_folder, _pattern, option);
+
+        var bag = new System.Collections.Concurrent.ConcurrentBag<ArchiveInfo>();
+
+        await Parallel.ForEachAsync(files, new ParallelOptions
+        {
+            CancellationToken = ct,
+            MaxDegreeOfParallelism = Environment.ProcessorCount
+        },
+        async (path, token) =>
+        {
+            try
+            {
+                var fi = new FileInfo(path);
+                if (!fi.Exists) return;
+
+                // ファイルを開いてハッシュ計算
+                await using var fs = new FileStream(
+                    path, FileMode.Open, FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete,
+                    bufferSize: 1024 * 64,
+                    options: FileOptions.Asynchronous | FileOptions.SequentialScan);
+
+                var hash = await SHA256.HashDataAsync(fs, token);
+
+                bag.Add(new ArchiveInfo(
+                    ArchiveName: fi.Name,
+                    FilePath: fi.FullName,
+                    Size: fi.Length,
+                    ModifiedUtc: fi.LastWriteTimeUtc,
+                    Hash: hash
+                ));
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                // 読み込み中などで開けないファイルはスキップ
+            }
+        });
+
+        // 一意キー（ファイル名）で辞書を構築。重複は新しい方を優先。
+        var builder = ImmutableDictionary.CreateBuilder<string, ArchiveInfo>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var info in bag)
+        {
+            if (!builder.TryGetValue(info.ArchiveName, out var existing))
+            {
+                builder[info.ArchiveName] = info;
+            }
+            else if (info.ModifiedUtc > existing.ModifiedUtc)
+            {
+                builder[info.ArchiveName] = info;
+            }
+        }
+
+        // スナップショットを原子的に入れ替え
+        _index.Replace(builder.ToImmutable());
+
+        _log.LogInformation("Snapshot updated: {Count} archives indexed", builder.Count);
+    }
+}
+```
+
+---
+
+## 💡ポイント
+
+* `_pattern` を `"*.zip"`, `"*.zipself"`, `"*.7z"` などに変えるだけで対応可能。
+  → `Directory.EnumerateFiles(_folder, _pattern, option)` はワイルドカードで検索します。
+* `Task.Run()` を使わずに `Parallel.ForEachAsync()` を利用。
+  これは .NET 6+ のネイティブ非同期版で、スレッドプール管理が最適化されています。
+* `FileInfo.Name` をキーにしているので、サーバ／クライアント間で異なるパス構成でも問題なし。
+* ファイルがロック中でも例外で止まらないように安全に握っています。
+
+---
+
+この `SnapshotWorker` を `Program.cs` で登録しておけば、
+30秒ごとに ZIP ファイル群のスナップショットが更新される状態になります。
+
+
+結論：**少しだけ要修正**です。
+いまの `ProcessService` は `FilePath` をキーにして差分を取っていますが、先に決めた「**アーカイブ名（`ArchiveName`＝`fi.Name`）で一意**」方針に合わせて、以下を直すと整合が取れます。
+
+# 変えるポイント
+
+1. 差分キーを `FilePath` → **`ArchiveName`** に変更
+2. ZIP 作成は **アーカイブ名 → スナップショットから実パスに解決** して詰める
+3. `Channel` の読取は `WaitToReadAsync` + `TryRead` より **`await foreach (_reader.ReadAllAsync(ct))`** が簡潔
+4. `JsonSerializerOptions` は毎回 new せず **static** に
+
+# 修正版 `ProcessService`（.NET 8）
+
+```csharp
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using System.Collections.Immutable;
+using System.IO.Compression;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading.Channels;
+using System.Globalization;
+
+public sealed class ProcessService : BackgroundService
+{
+    private readonly ILogger<ProcessService> _log;
+    private readonly ChannelReader<SyncJob> _reader;
+    private readonly IFileIndex _index;
+    private readonly string _bundleDir = Path.Combine(Path.GetTempPath(), "sync-bundles");
+    private readonly int _workers = Math.Max(1, Environment.ProcessorCount / 2);
+
+    private static readonly JsonSerializerOptions JsonOpt = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
+
+    public ProcessService(ILogger<ProcessService> log, ChannelReader<SyncJob> reader, IFileIndex index)
+    {
+        _log = log; _reader = reader; _index = index;
+        Directory.CreateDirectory(_bundleDir);
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        var tasks = Enumerable.Range(0, _workers)
+            .Select(i => WorkerLoopAsync(i, stoppingToken)).ToArray();
+
+        await Task.WhenAll(tasks);
+    }
+
+    private async Task WorkerLoopAsync(int id, CancellationToken ct)
+    {
+        _log.LogInformation("Worker {Id} started", id);
+
+        try
+        {
+            await foreach (var job in _reader.ReadAllAsync(ct))
+            {
+                try
+                {
+                    var req = JsonSerializer.Deserialize<ClientSyncRequest>(job.Json, JsonOpt) ?? new();
+
+                    // 差分は “アーカイブ名” で突き合わせる
+                    var diff = ComputeDiffByName(_index.Snapshot, req);
+
+                    // 必要なら ZIP バンドルを作る（アーカイブ名→実パスに解決）
+                    string? zipPath = null;
+                    if (req.BundleMissingAsZip && diff.ToDownload.Count > 0)
+                        zipPath = await CreateBundleByNameAsync(diff.ToDownload, _index.Snapshot, ct);
+
+                    job.Tcs.TrySetResult(new ServerSyncResult
+                    {
+                        ToDownload = diff.ToDownload,
+                        ToDelete   = diff.ToDelete,
+                        UpToDate   = diff.UpToDate,
+                        ZipPath    = zipPath
+                    });
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    job.Tcs.TrySetResult(new ServerSyncResult { Error = "processing_failed" });
+                    _log.LogWarning(ex, "Worker {Id} failed", id);
+                }
+            }
+        }
+        catch (OperationCanceledException) { /* stopping */ }
+        _log.LogInformation("Worker {Id} stopped", id);
+    }
+
+    // ---- 差分（キー＝ArchiveName）----
+    private static (List<string> ToDownload, List<string> ToDelete, List<string> UpToDate)
+        ComputeDiffByName(ImmutableDictionary<string, ArchiveInfo> server, ClientSyncRequest req)
+    {
+        // クライアント側も ArchiveName を送ってくる前提
+        var cli = (req.Files ?? new()).ToDictionary(x => x.ArchiveName, x => x, StringComparer.OrdinalIgnoreCase);
+
+        var toDownload = new List<string>();
+        var toDelete   = new List<string>();
+        var upToDate   = new List<string>();
+
+        foreach (var (name, s) in server)
+        {
+            if (!cli.TryGetValue(name, out var c))
+                toDownload.Add(name);
+            else if (!HashesEqual(s.Hash, c.Sha256Hex))
+                toDownload.Add(name);
+            else
+                upToDate.Add(name);
+        }
+        foreach (var (name, _) in cli)
+            if (!server.ContainsKey(name))
+                toDelete.Add(name);
+
+        return (toDownload, toDelete, upToDate);
+    }
+
+    // ---- ZIP作成（アーカイブ名→実パスに解決）----
+    private async Task<string> CreateBundleByNameAsync(
+        List<string> archiveNames,
+        ImmutableDictionary<string, ArchiveInfo> snap,
+        CancellationToken ct)
+    {
+        var name = $"bundle_{DateTimeOffset.UtcNow:yyyyMMdd_HHmmssfff}.zip";
+        var zip  = Path.Combine(_bundleDir, name);
+
+        using var fs = new FileStream(zip, FileMode.Create, FileAccess.Write, FileShare.None);
+        using var za = new ZipArchive(fs, ZipArchiveMode.Create, leaveOpen: false);
+
+        foreach (var an in archiveNames)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (!snap.TryGetValue(an, out var info)) continue; // 念のため存在確認
+
+            var entry = za.CreateEntry(an, CompressionLevel.Fastest); // 大量配布なら Fastest のほうが総合的に速い
+            using var es  = entry.Open();
+            using var src = new FileStream(info.FilePath, FileMode.Open, FileAccess.Read,
+                                           FileShare.ReadWrite | FileShare.Delete);
+            await src.CopyToAsync(es, ct);
+        }
+        return zip;
+    }
+
+    // ---- ハッシュ比較（Span最適化版でもOK）----
+    private static bool HashesEqual(byte[] serverHash, string? clientHex)
+    {
+        if (string.IsNullOrWhiteSpace(clientHex) || clientHex.Length != 64)
+            return false;
+
+        Span<byte> buf = stackalloc byte[32];
+        for (int i = 0; i < 32; i++)
+        {
+            // 低GCにしたいなら byte.Parse(span, NumberStyles.HexNumber, CultureInfo.InvariantCulture)
+            string hexByte = clientHex.Substring(i * 2, 2);
+            buf[i] = Convert.ToByte(hexByte, 16);
+        }
+        return serverHash.AsSpan().SequenceEqual(buf);
+    }
+}
+```
+
+## 併せて直すべき DTO（重要）
+
+* クライアント/サーバ間での照合キーを **`ArchiveName`** に統一してください。
+
+```csharp
+public sealed class ClientSyncRequest
+{
+    public List<ClientFileInfo>? Files { get; set; }
+    public bool BundleMissingAsZip { get; set; } = true;
+}
+
+public sealed class ClientFileInfo
+{
+    public string ArchiveName { get; set; } = "";   // ← ここを FilePath から変更
+    public long Size { get; set; }
+    public DateTimeOffset ModifiedUtc { get; set; }
+    public string? Sha256Hex { get; set; }
+}
+
+public sealed class ServerSyncResult
+{
+    public List<string> ToDownload { get; set; } = new(); // ← アーカイブ名の配列
+    public List<string> ToDelete   { get; set; } = new();
+    public List<string> UpToDate   { get; set; } = new();
+    public string? ZipPath { get; set; }
+    public string? Error { get; set; }
+}
+```
+
+> スナップショット側（`ArchiveInfo`）は `ArchiveName` と `FilePath` の両方を持たせてOKです（名寄せキー＋実パス解決用）。
+
+---
+
+これで「**名前一意**」の前提に沿って、
+
+* 差分は**名前**で厳密に判定
+* ZIP 詰めは**スナップショットで実パスに解決**
+* Channel コンシューマは**シンプルな ReadAllAsync**
+
+…という形に整理できます。
+
