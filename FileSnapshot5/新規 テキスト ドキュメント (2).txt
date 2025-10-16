@@ -1,0 +1,574 @@
+了解です。
+では、あなたのこれまでの設計意図（
+
+* SnapshotWorker: サーバー側ファイルのスナップショット管理
+* AcceptService: クライアント接続受け付け・ジョブ投入
+* ProcessService: ファイル送信などの重い処理
+
+）を維持しながら、
+**「接続ごとに Channel を分離」して安全に並列化する完全版コード（.NET 8対応）**
+を示します。
+
+---
+
+# 🧱 サーバー構成（接続ごと Channel 分離版）
+
+## 🔹 Program.cs
+
+```csharp
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+
+public static class Program
+{
+    public static async Task Main(string[] args)
+    {
+        using var host = Host.CreateDefaultBuilder(args)
+            .ConfigureServices(s =>
+            {
+                s.AddSingleton<IFileIndex, InMemoryFileIndex>();
+                s.AddHostedService<SnapshotWorker>();
+                s.AddHostedService<AcceptService>();
+            })
+            .Build();
+
+        await host.RunAsync();
+    }
+}
+```
+
+---
+
+## 🔹 SnapshotWorker.cs
+
+サーバー側フォルダを30秒ごとにスキャンしてスナップショット更新。
+
+```csharp
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using System.Collections.Concurrent;
+using System.Collections.Immutable;
+using System.Security.Cryptography;
+
+public sealed class SnapshotWorker : BackgroundService
+{
+    private readonly ILogger<SnapshotWorker> _log;
+    private readonly IFileIndex _index;
+    private readonly string _folder = @"D:\data";
+    private readonly TimeSpan _period = TimeSpan.FromSeconds(30);
+
+    public SnapshotWorker(ILogger<SnapshotWorker> log, IFileIndex index)
+    {
+        _log = log; _index = index;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        await BuildAndSwapAsync(stoppingToken);
+        using var timer = new PeriodicTimer(_period);
+        while (await timer.WaitForNextTickAsync(stoppingToken))
+        {
+            try { await BuildAndSwapAsync(stoppingToken); }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex) { _log.LogWarning(ex, "Snapshot update failed"); }
+        }
+    }
+
+    private async Task BuildAndSwapAsync(CancellationToken ct)
+    {
+        var files = Directory.EnumerateFiles(_folder, "*.zip", SearchOption.TopDirectoryOnly);
+        var bag = new ConcurrentBag<ArchiveInfo>();
+
+        await Parallel.ForEachAsync(files, new ParallelOptions { CancellationToken = ct, MaxDegreeOfParallelism = Environment.ProcessorCount },
+        async (path, token) =>
+        {
+            try
+            {
+                var fi = new FileInfo(path);
+                await using var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete, 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                var hash = await SHA256.HashDataAsync(fs, token);
+                bag.Add(new ArchiveInfo(fi.FullName, fi.Length, fi.LastWriteTimeUtc, hash));
+            }
+            catch { }
+        });
+
+        var builder = ImmutableDictionary.CreateBuilder<string, ArchiveInfo>(StringComparer.OrdinalIgnoreCase);
+        foreach (var f in bag)
+            builder[f.FilePath] = f;
+
+        _index.Replace(builder.ToImmutable());
+        _log.LogInformation("Snapshot updated: {Count} files", builder.Count);
+    }
+}
+```
+
+---
+
+## 🔹 Model.cs
+
+共有データモデル
+
+```csharp
+using System.Collections.Immutable;
+
+public sealed record ArchiveInfo(string FilePath, long Size, DateTimeOffset ModifiedUtc, byte[] Hash);
+
+public interface IFileIndex
+{
+    ImmutableDictionary<string, ArchiveInfo> Snapshot { get; }
+    void Replace(ImmutableDictionary<string, ArchiveInfo> next);
+}
+
+public sealed class InMemoryFileIndex : IFileIndex
+{
+    private ImmutableDictionary<string, ArchiveInfo> _snap =
+        ImmutableDictionary<string, ArchiveInfo>.Empty.WithComparers(StringComparer.OrdinalIgnoreCase);
+
+    public ImmutableDictionary<string, ArchiveInfo> Snapshot => System.Threading.Volatile.Read(ref _snap);
+
+    public void Replace(ImmutableDictionary<string, ArchiveInfo> next) =>
+        System.Threading.Interlocked.Exchange(ref _snap, next);
+}
+
+public sealed record SyncJob(
+    string FilePath,
+    long ClientUnixMs,
+    long ClientSize,
+    StreamWriter Writer,
+    NetworkStream Stream,
+    TaskCompletionSource<bool> Completion
+);
+```
+
+---
+
+## 🔹 AcceptService.cs（メインサービス）
+
+クライアントを受け付け、接続ごとに専用 Channel と Worker を生成。
+
+```csharp
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Channels;
+
+public sealed class AcceptService : BackgroundService
+{
+    private readonly ILogger<AcceptService> _log;
+    private readonly IFileIndex _index;
+    private readonly int _port = 5001;
+    private readonly ConcurrentDictionary<TcpClient, Channel<SyncJob>> _channels = new();
+
+    public AcceptService(ILogger<AcceptService> log, IFileIndex index)
+    { _log = log; _index = index; }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        var listener = new TcpListener(IPAddress.Any, _port);
+        listener.Start();
+        _log.LogInformation("Listening on port {Port}", _port);
+
+        try
+        {
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                var client = await listener.AcceptTcpClientAsync(stoppingToken);
+                _log.LogInformation("Accepted: {Client}", client.Client.RemoteEndPoint);
+
+                var ch = Channel.CreateUnbounded<SyncJob>(new UnboundedChannelOptions
+                {
+                    SingleReader = true,
+                    SingleWriter = false
+                });
+                _channels[client] = ch;
+
+                _ = Task.Run(() => HandleClientAsync(client, ch.Writer, stoppingToken), stoppingToken);
+                _ = Task.Run(() => ClientWorkerLoopAsync(client, ch.Reader, stoppingToken), stoppingToken);
+            }
+        }
+        catch (OperationCanceledException) { }
+        finally
+        {
+            listener.Stop();
+            _log.LogInformation("Server stopped");
+        }
+    }
+
+    private async Task HandleClientAsync(TcpClient client, ChannelWriter<SyncJob> writer, CancellationToken ct)
+    {
+        using var ns = client.GetStream();
+        using var reader = new StreamReader(ns, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, leaveOpen: true);
+        using var w = new StreamWriter(ns, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
+
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                var line = await reader.ReadLineAsync(ct);
+                if (string.IsNullOrWhiteSpace(line)) break;
+
+                if (!line.StartsWith("SYNCGET|", StringComparison.OrdinalIgnoreCase))
+                {
+                    await w.WriteLineAsync("ERROR|unknown_command");
+                    await w.FlushAsync();
+                    continue;
+                }
+
+                var parts = line.Split('|', 4);
+                if (parts.Length != 4 ||
+                    !long.TryParse(parts[2], out var clientUnixMs) ||
+                    !long.TryParse(parts[3], out var clientSize))
+                {
+                    await w.WriteLineAsync("ERROR|bad_request");
+                    await w.FlushAsync();
+                    continue;
+                }
+
+                var filePath = parts[1];
+                var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                await writer.WriteAsync(new SyncJob(filePath, clientUnixMs, clientSize, w, ns, tcs), ct);
+                await tcs.Task;
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { _log.LogWarning(ex, "Client error"); }
+        finally
+        {
+            writer.Complete();
+            client.Close();
+            _channels.TryRemove(client, out _);
+            _log.LogInformation("Client disconnected: {Client}", client.Client.RemoteEndPoint);
+        }
+    }
+
+    private async Task ClientWorkerLoopAsync(TcpClient client, ChannelReader<SyncJob> reader, CancellationToken ct)
+    {
+        _log.LogInformation("Worker started for {Client}", client.Client.RemoteEndPoint);
+
+        try
+        {
+            await foreach (var job in reader.ReadAllAsync(ct))
+            {
+                try
+                {
+                    await HandleOneAsync(job, ct);
+                    job.Completion.TrySetResult(true);
+                }
+                catch (Exception ex)
+                {
+                    job.Completion.TrySetException(ex);
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+        _log.LogInformation("Worker stopped for {Client}", client.Client.RemoteEndPoint);
+    }
+
+    private async Task HandleOneAsync(SyncJob job, CancellationToken ct)
+    {
+        var snap = _index.Snapshot;
+        if (!snap.TryGetValue(job.FilePath, out var info) || !File.Exists(info.FilePath))
+        {
+            await job.Writer.WriteLineAsync("NOTFOUND");
+            await job.Writer.FlushAsync();
+            return;
+        }
+
+        var fi = new FileInfo(info.FilePath);
+        var serverSize = fi.Length;
+        var serverUnixMs = new DateTimeOffset(fi.LastWriteTimeUtc).ToUnixTimeMilliseconds();
+        var modified = serverSize != job.ClientSize || serverUnixMs > job.ClientUnixMs;
+
+        if (!modified)
+        {
+            await job.Writer.WriteLineAsync("NOTMODIFIED");
+            await job.Writer.FlushAsync();
+            return;
+        }
+
+        await job.Writer.WriteLineAsync($"FILEB64|{Path.GetFileName(info.FilePath)}|{serverSize}");
+        await job.Writer.FlushAsync();
+
+        using var fs = new FileStream(info.FilePath, FileMode.Open, FileAccess.Read,
+                                      FileShare.ReadWrite | FileShare.Delete, 128 * 1024, FileOptions.SequentialScan);
+        using var transform = new System.Security.Cryptography.ToBase64Transform();
+
+        byte[] inBuf = new byte[57 * 1024];
+        byte[] outBuf = new byte[inBuf.Length * 2];
+        int n;
+        while ((n = await fs.ReadAsync(inBuf, 0, inBuf.Length, ct)) > 0)
+        {
+            var outN = transform.TransformBlock(inBuf, 0, n - (n % 3), outBuf, 0);
+            await job.Stream.WriteAsync(outBuf.AsMemory(0, outN), ct);
+            if (n % 3 != 0)
+            {
+                var final = transform.TransformFinalBlock(inBuf, n - (n % 3), n % 3);
+                await job.Stream.WriteAsync(final, ct);
+            }
+        }
+        await job.Stream.FlushAsync(ct);
+    }
+}
+```
+
+---
+
+## ✅ この設計の特徴
+
+| 項目          | 内容                                  |
+| ----------- | ----------------------------------- |
+| **Channel** | クライアントごとに独立 (`SingleReader = true`) |
+| **Worker**  | 各クライアント専用。順序保証あり                    |
+| **並列性**     | 他クライアントとの間は並列動作                     |
+| **安全性**     | 同一 NetworkStream に同時書き込みなし          |
+| **拡張性**     | ファイル送信以外のジョブも容易に追加可                 |
+
+---
+
+次に希望があれば、このサーバーに対応する
+.NET 8 クライアント（複数ファイル順次リクエスト対応）も出せます。
+作りますか？
+
+
+いいよ—「**接続ごと Channel 分離**」版のサーバーに対応する **.NET 8 クライアント（複数ファイル順次リクエスト対応）**を丸っと出します。
+1 接続のまま、**ファイルごとに `SYNCGET` を順送り**→サーバの返答を受けて保存します。
+
+---
+
+# クライアント（.NET 8）Program.cs
+
+```csharp
+// dotnet new console -n SyncClient && これを Program.cs に貼り付けてください
+using System;
+using System.IO;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+class Program
+{
+    // 使い方:
+    //   dotnet run -- <serverHost> <port> <destFolder> <filePath1> [<filePath2> ...]
+    // 例:
+    //   dotnet run -- 127.0.0.1 5001 . "D:\\data\\a.zip" "D:\\data\\b.zip"
+    static async Task<int> Main(string[] args)
+    {
+        if (args.Length < 4)
+        {
+            Console.WriteLine("Usage: SyncClient <host> <port> <destFolder> <filePath1> [filePath2 ...]");
+            return 2;
+        }
+
+        string host = args[0];
+        if (!int.TryParse(args[1], out var port)) { Console.WriteLine("Invalid port"); return 2; }
+        string destFolder = args[2];
+        Directory.CreateDirectory(destFolder);
+
+        string[] serverFilePaths = args[3..];
+
+        Console.WriteLine($"[Client] {host}:{port}  Dest='{destFolder}'  Files={serverFilePaths.Length}");
+
+        using var cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+        try
+        {
+            using var cli = new TcpClient();
+            await cli.ConnectAsync(host, port, cts.Token);
+
+            using var ns = cli.GetStream();
+            using var bs = new BufferedStream(ns, 64 * 1024);
+            using var reader = new StreamReader(bs, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, leaveOpen: true);
+            using var writer = new StreamWriter(bs, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
+
+            // 同一接続で複数ファイルを順送り（1ファイルずつ完了待ち）
+            foreach (var serverFilePath in serverFilePaths)
+            {
+                var (clientSize, clientUnixMs) = GetLocalMetaFor(serverFilePath, destFolder);
+                await writer.WriteLineAsync($"SYNCGET|{serverFilePath}|{clientUnixMs}|{clientSize}");
+                await writer.FlushAsync();
+
+                var header = await reader.ReadLineAsync(cts.Token);
+                if (string.IsNullOrWhiteSpace(header))
+                    throw new IOException("Empty response");
+
+                if (header.StartsWith("ERROR|", StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine($"[Client] ERROR from server: {header}");
+                    continue;
+                }
+                if (header.Equals("NOTFOUND", StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine($"[Client] NOTFOUND: {serverFilePath}");
+                    continue;
+                }
+                if (header.Equals("NOTMODIFIED", StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine($"[Client] Up-to-date: {serverFilePath}");
+                    continue;
+                }
+
+                // FILEB64|<name>|<rawLen>
+                if (!header.StartsWith("FILEB64|", StringComparison.OrdinalIgnoreCase))
+                    throw new IOException($"Unexpected header: {header}");
+
+                var parts = header.Split('|', 3, StringSplitOptions.TrimEntries);
+                if (parts.Length != 3 || !long.TryParse(parts[2], out var rawLen) || rawLen < 0)
+                    throw new IOException($"Bad FILEB64 header: {header}");
+
+                var fileName = parts[1];
+                long b64Len = ((rawLen + 2) / 3) * 4; // Base64 文字数を算出
+
+                var destPath = Path.Combine(destFolder, Path.GetFileName(fileName));
+                var tmp = destPath + ".tmp";
+                Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
+                Console.WriteLine($"[Client] Receiving {fileName}  raw={rawLen:N0}  b64={b64Len:N0}");
+
+                await ReceiveBase64ToFileAsync(reader, b64Len, tmp, cts.Token);
+
+                // 受信サイズ検証（任意：rawLen と実体サイズは一致するはず）
+                var outLen = new FileInfo(tmp).Length;
+                if (outLen != rawLen)
+                {
+                    File.Delete(tmp);
+                    throw new IOException($"Size mismatch: expected {rawLen}, got {outLen}");
+                }
+
+                if (File.Exists(destPath))
+                    File.Replace(tmp, destPath, destPath + ".bak", ignoreMetadataErrors: true);
+                else
+                    File.Move(tmp, destPath, overwrite: true);
+
+                Console.WriteLine($"[Client] OK: {destPath}");
+            }
+
+            Console.WriteLine("[Client] Done.");
+            return 0;
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("[Client] Canceled.");
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[Client] FAIL: " + ex.Message);
+            return 1;
+        }
+    }
+
+    // ローカルの既存ファイル（保存先）情報を取得（なければ 0,0）
+    private static (long size, long unixMs) GetLocalMetaFor(string serverFilePath, string destFolder)
+    {
+        var localName = Path.GetFileName(serverFilePath);
+        var localPath = Path.Combine(destFolder, localName);
+        var fi = new FileInfo(localPath);
+        if (!fi.Exists) return (0, 0);
+        var size = fi.Length;
+        var unixMs = new DateTimeOffset(fi.LastWriteTimeUtc).ToUnixTimeMilliseconds();
+        return (size, unixMs);
+    }
+
+    // Base64 の総文字数 b64Len をきっちり読み、ストリーミングでデコード→ファイルへ書く
+    private static async Task ReceiveBase64ToFileAsync(StreamReader reader, long b64Len, string outPath, CancellationToken ct)
+    {
+        using var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None, 128 * 1024, useAsync: true);
+        // char→byte 変換は不要：Convert.FromBase64CharArray を使う（チャンク端の 4 の倍数問題に注意）
+        var buf = new char[8192];
+        var carry = new char[4];
+        int carryLen = 0;
+
+        long remaining = b64Len;
+        while (remaining > 0)
+        {
+            int need = (int)Math.Min(buf.Length, remaining);
+            int n = await reader.ReadAsync(buf, 0, need);
+            if (n <= 0) throw new EndOfStreamException("base64 stream ended early");
+            remaining -= n;
+
+            // carry と結合して 4 の倍数までデコード
+            int total = carryLen + n;
+            int full = (total / 4) * 4; // デコードできる総文字数
+            if (full > 0)
+            {
+                // work にデコード分を作る
+                char[] work = new char[full];
+                // 先頭に carry を詰め、残りは buf から
+                if (carryLen > 0)
+                {
+                    Array.Copy(carry, 0, work, 0, carryLen);
+                    Array.Copy(buf, 0, work, carryLen, full - carryLen);
+                }
+                else
+                {
+                    Array.Copy(buf, 0, work, 0, full);
+                }
+
+                var decoded = Convert.FromBase64CharArray(work, 0, work.Length);
+                await fs.WriteAsync(decoded, 0, decoded.Length, ct);
+            }
+
+            // 新しい carry を更新（full で使い切れなかった末尾分）
+            int leftover = total - full;
+            if (leftover > 0)
+            {
+                // buf のどこから carry を取るか
+                // total = carryLen + n
+                //  full  を消費したので、残りは末尾 leftover 文字
+                // それが buf 側に何文字・carry 側に何文字あるかを計算
+                // 簡単化：まず全体列を仮想的に並べたとして末尾 leftover を抜く
+                // 末尾 leftover のうち、buf から取る数:
+                int takeFromBuf = Math.Min(leftover, n);
+                int takeFromPrevCarry = leftover - takeFromBuf;
+
+                if (takeFromPrevCarry > 0)
+                    Array.Copy(carry, carryLen - takeFromPrevCarry, carry, 0, takeFromPrevCarry);
+
+                if (takeFromBuf > 0)
+                    Array.Copy(buf, n - takeFromBuf, carry, takeFromPrevCarry, takeFromBuf);
+
+                carryLen = leftover;
+            }
+            else
+            {
+                carryLen = 0;
+            }
+        }
+
+        // ここで b64Len をきっちり読み終えているので、通常 carryLen は 0 のはず
+        if (carryLen > 0)
+        {
+            var decoded = Convert.FromBase64CharArray(carry, 0, carryLen);
+            await fs.WriteAsync(decoded, 0, decoded.Length, ct);
+        }
+        await fs.FlushAsync(ct);
+    }
+}
+```
+
+---
+
+## どう動くか（ポイントだけ）
+
+* サーバが返すヘッダは `FILEB64|<name>|<rawLen>`（前回あなたが作ったサーバの最新版に合わせています）。
+* クライアントは `rawLen` から **Base64 の文字数 `b64Len=((rawLen+2)/3)*4`** を計算。
+  → これで**ちょうど `b64Len` 文字だけ**を `StreamReader` で読み取り、**ストリーミングでデコード**してファイルへ。
+* 複数ファイルは **同じ接続で順送り**（サーバ側は“接続ごと Channel 分離”なので競合しません）。
+* 保存先は第3引数の `destFolder`。同名があれば置き換え（`.bak`は作らず簡易）。
+
+---
+
+## ちょい足しTips（必要なら）
+
+* 進捗表示：`remaining` と `b64Len` で割合を出してコンソールに書くだけでOK。
+* リトライ：`try/catch` で個別ファイルの再送ロジックを包む。
+* 検証：SHA-256 を併用したい場合は、サーバがヘッダに `shaHex` を追加→クライアントで受信後に検証。
+
+---
+
+必要なら、**サーバ側も `FILEB64|name|rawLen|b64Len` にしてほしい**等の微調整にも合わせてクライアントを出し直します。
