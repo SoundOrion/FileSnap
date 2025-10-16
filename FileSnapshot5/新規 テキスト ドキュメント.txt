@@ -1,0 +1,90 @@
+using System;
+using System.IO;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Tasks;
+
+public static class SyncClient
+{
+    public static async Task RunAsync(string server, int port, string filePath)
+    {
+        using var client = new TcpClient();
+        await client.ConnectAsync(server, port);
+
+        using var ns = client.GetStream();
+        using var bs = new BufferedStream(ns, 64 * 1024);
+        using var reader = new StreamReader(bs, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, leaveOpen: true);
+        using var writer = new StreamWriter(bs, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
+
+        // ローカルファイル情報
+        var fi = new FileInfo(filePath);
+        var mtime = new DateTimeOffset(fi.LastWriteTimeUtc).ToUnixTimeMilliseconds();
+        var size = fi.Exists ? fi.Length : 0;
+
+        // SYNCGET コマンド送信
+        await writer.WriteLineAsync($"SYNCGET|{filePath}|{mtime}|{size}");
+        await writer.FlushAsync();
+
+        // 応答読み取り
+        var header = await reader.ReadLineAsync();
+        if (header is null)
+        {
+            Console.WriteLine("サーバー応答が空です。");
+            return;
+        }
+
+        if (header.StartsWith("ERROR|"))
+        {
+            Console.WriteLine("サーバーエラー: " + header);
+            return;
+        }
+
+        if (header.Equals("NOTFOUND", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine("サーバーに該当ファイルが存在しません。");
+            return;
+        }
+
+        if (header.Equals("NOTMODIFIED", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine("ファイルは最新です。");
+            return;
+        }
+
+        if (header.StartsWith("FILEB64|"))
+        {
+            var parts = header.Split('|');
+            if (parts.Length < 4)
+            {
+                Console.WriteLine("ヘッダ解析失敗: " + header);
+                return;
+            }
+
+            var name = parts[1];
+            var rawLen = long.Parse(parts[2]);
+            var b64Len = long.Parse(parts[3]);
+
+            Console.WriteLine($"ファイル受信中: {name} ({rawLen:N0} bytes, base64 {b64Len:N0})");
+
+            var outPath = Path.Combine(Environment.CurrentDirectory, Path.GetFileName(name));
+            using var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None);
+
+            // Base64 読み込みバッファ
+            var buf = new char[8192];
+            var sb = new StringBuilder();
+            long readChars = 0;
+
+            while (readChars < b64Len)
+            {
+                int n = await reader.ReadAsync(buf, 0, (int)Math.Min(buf.Length, b64Len - readChars));
+                if (n <= 0) break;
+                sb.Append(buf, 0, n);
+                readChars += n;
+            }
+
+            var bytes = Convert.FromBase64String(sb.ToString());
+            await fs.WriteAsync(bytes, 0, bytes.Length);
+            Console.WriteLine($"受信完了: {outPath}");
+        }
+    }
+}
