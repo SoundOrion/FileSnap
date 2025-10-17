@@ -1,0 +1,1343 @@
+いいところに気づきました 👀
+はい、C# の `TcpListener` や `TcpClient` で「接続中かどうか（Connected）」や「生きてるか（IsAlive）」を知りたいという話ですね。
+ただし — **ここは注意が必要なポイント** です。
+
+---
+
+## 💡 まず前提
+
+### `TcpClient.Connected` プロパティ
+
+```csharp
+client.Connected
+```
+
+これは **「最後に送受信した時点で接続されていたか」** を返します。
+リアルタイムな状態ではありません。つまり：
+
+| 状況             | `Connected` の値         |
+| -------------- | ---------------------- |
+| 接続直後           | `true`                 |
+| 相手が正常に切断       | `false`                |
+| 相手が異常終了／ケーブル抜け | **しばらく `true` のまま！** ❌ |
+
+👉 つまり「接続が切れたかどうかの正確な検出には使えない」。
+
+---
+
+## ✅ 代わりの正しいやり方
+
+### ① 軽い ping／ポーリング（受信チェック）
+
+```csharp
+bool IsConnected(TcpClient client)
+{
+    try
+    {
+        if (client.Client.Poll(0, SelectMode.SelectRead))
+        {
+            return client.Client.Available != 0;
+        }
+        return true;
+    }
+    catch
+    {
+        return false;
+    }
+}
+```
+
+* `Poll(0, SelectMode.SelectRead)` が `true` かつ `Available == 0` のときは、相手が切断済み。
+* 非ブロッキングで軽いチェックができます。
+
+---
+
+### ② 定期的な送信テスト（“心拍”方式）
+
+サーバー → クライアントに定期的に軽い ping パケットを送って応答を見ます。
+（例：`PING` 送って、応答が `PONG` なら生きている。）
+
+これは「常時接続・長期アイドル状態を維持する」系のアプリ（チャットやWebSocket風など）でよく使います。
+
+---
+
+### ③ WeakReference で `IsAlive` を見る
+
+`WeakReference` は **GC（ガベージコレクション）対象かどうか** を確認するためのもので、
+TCP接続の「生死」とは無関係です。
+
+```csharp
+WeakReference<TcpClient> weak = new(client);
+...
+if (weak.TryGetTarget(out var cli) && cli.Connected) { ... }
+```
+
+これは「オブジェクトがGCで消されたか」だけを判定できますが、
+**ソケットの接続状態とは別次元**の話です。
+したがって「WeakReference.IsAlive」では「接続中かどうか」は判断できません。
+
+---
+
+## ⚙️ 実践的まとめ
+
+| 方法                      | 判定内容         | 適用例          | 備考        |
+| ----------------------- | ------------ | ------------ | --------- |
+| `client.Connected`      | 最後の送受信時点の状態  | 単発通信         | 遅延判定になる   |
+| `Poll(0, SelectRead)`   | ソケットレベルで即時判定 | TCPサーバー      | 実用的 👍    |
+| “PING/PONG”             | アプリレベル心拍監視   | 長期接続（チャットなど） | もっとも信頼性高い |
+| `WeakReference.IsAlive` | GC生存確認のみ     | メモリ監視用       | 接続とは無関係 ❌ |
+
+---
+
+もし、あなたのサーバーで「クライアント切断を検出してクリーンアップしたい」なら、
+`Poll(0, SelectMode.SelectRead)`＋`Available == 0` を一定間隔で監視するのが最もシンプルです。
+
+---
+
+必要なら、「サーバー側で接続リストをConcurrentBagに保持し、
+定期的に死んだクライアントを削除する」実装例も書けます。
+出してみましょうか？
+
+とても良い整理ですね 👏
+内容的にも実践現場で役立つ説明になっています。
+では、ご希望の「サーバー側で接続リストを管理し、死んだクライアントを定期的に削除する」サンプルを出してみましょう。
+
+---
+
+## 💻 サーバー側実装例：`TcpListener` + 定期チェック
+
+```csharp
+using System;
+using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+
+class TcpServer
+{
+    private readonly TcpListener listener;
+    private readonly ConcurrentBag<TcpClient> clients = new();
+    private readonly CancellationTokenSource cts = new();
+
+    public TcpServer(int port)
+    {
+        listener = new TcpListener(IPAddress.Any, port);
+    }
+
+    public void Start()
+    {
+        listener.Start();
+        Console.WriteLine("Server started...");
+
+        // 接続受付スレッド
+        ThreadPool.QueueUserWorkItem(_ => AcceptLoop());
+
+        // クライアント監視スレッド
+        ThreadPool.QueueUserWorkItem(_ => MonitorLoop());
+    }
+
+    private void AcceptLoop()
+    {
+        while (!cts.Token.IsCancellationRequested)
+        {
+            try
+            {
+                var client = listener.AcceptTcpClient();
+                clients.Add(client);
+                Console.WriteLine($"Client connected: {client.Client.RemoteEndPoint}");
+                ThreadPool.QueueUserWorkItem(_ => HandleClient(client));
+            }
+            catch { /* ignore */ }
+        }
+    }
+
+    private void HandleClient(TcpClient client)
+    {
+        using var stream = client.GetStream();
+        var buffer = new byte[1024];
+        try
+        {
+            while (true)
+            {
+                int bytesRead = stream.Read(buffer, 0, buffer.Length);
+                if (bytesRead == 0) break; // 切断検出
+                string msg = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                Console.WriteLine($"[{client.Client.RemoteEndPoint}] {msg}");
+            }
+        }
+        catch { /* 通信エラーなど */ }
+        finally
+        {
+            Console.WriteLine($"Client disconnected: {client.Client.RemoteEndPoint}");
+            client.Close();
+        }
+    }
+
+    private void MonitorLoop()
+    {
+        while (!cts.Token.IsCancellationRequested)
+        {
+            foreach (var client in clients)
+            {
+                if (!IsConnected(client))
+                {
+                    Console.WriteLine($"Detected dead client: {client.Client.RemoteEndPoint}");
+                    client.Close();
+                }
+            }
+            Thread.Sleep(5000); // 5秒ごとにチェック
+        }
+    }
+
+    private bool IsConnected(TcpClient client)
+    {
+        try
+        {
+            if (client == null || !client.Connected) return false;
+            if (client.Client.Poll(0, SelectMode.SelectRead))
+            {
+                return client.Client.Available != 0;
+            }
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public void Stop()
+    {
+        cts.Cancel();
+        listener.Stop();
+        foreach (var client in clients)
+            client.Close();
+    }
+}
+```
+
+---
+
+## 🔍 この実装のポイント
+
+| 処理内容                           | 説明                     |
+| ------------------------------ | ---------------------- |
+| `ConcurrentBag<TcpClient>`     | スレッドセーフに複数クライアントを保持    |
+| `Poll + Available` チェック        | TCPソケットが実際に生きているか即時判定  |
+| 定期監視 (`MonitorLoop`)           | 5秒ごとに死んだクライアントを検出      |
+| `ThreadPool.QueueUserWorkItem` | 軽量な並列処理（スレッド生成コストを最小化） |
+
+---
+
+## 💬 応用アイデア
+
+* 心拍（`PING`/`PONG`）を入れる場合は、`HandleClient` 内で `Timer` を使って送信。
+* `ConcurrentBag` だと削除が面倒なので、頻繁に切断が起きる用途なら `ConcurrentDictionary<EndPoint, TcpClient>` のほうが実用的。
+* クライアント数が多い場合は `async/await` ベース（`TcpListener.AcceptTcpClientAsync()`）にするとスケールしやすい。
+
+---
+
+もし希望があれば、
+👉 `async`/`await` 版や「PING/PONG」付きバージョンのサンプルも出せます。
+どちらに興味ありますか？
+
+了解！`async/await` でスケールしやすく、クリーンに停止できる版を用意しました。
+`ConcurrentDictionary` で接続を管理し、`AcceptLoop` / `HandleClient` / `MonitorLoop` をすべて非同期化しています。
+
+```csharp
+using System;
+using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+public sealed class TcpServer : IAsyncDisposable
+{
+    private readonly TcpListener _listener;
+    private readonly ConcurrentDictionary<EndPoint, TcpClient> _clients = new();
+    private readonly TimeSpan _monitorInterval;
+    private CancellationTokenSource? _cts;
+    private Task? _acceptTask;
+    private Task? _monitorTask;
+
+    public TcpServer(int port, TimeSpan? monitorInterval = null)
+    {
+        _listener = new TcpListener(IPAddress.Any, port);
+        _monitorInterval = monitorInterval ?? TimeSpan.FromSeconds(5);
+    }
+
+    public async Task StartAsync(CancellationToken cancellationToken = default)
+    {
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _listener.Start();
+        Console.WriteLine("Server started...");
+
+        _acceptTask = AcceptLoopAsync(_cts.Token);
+        _monitorTask = MonitorLoopAsync(_cts.Token);
+        await Task.CompletedTask;
+    }
+
+    public async Task StopAsync()
+    {
+        if (_cts is null) return;
+        _cts.Cancel();
+        _listener.Stop();
+
+        // Close all clients
+        foreach (var kv in _clients)
+        {
+            try { kv.Value.Close(); } catch { /* ignore */ }
+        }
+
+        // Wait loops to finish
+        var tasks = new[] { _acceptTask, _monitorTask };
+        await Task.WhenAll(tasks.Where(t => t is not null)!);
+    }
+
+    public async ValueTask DisposeAsync() => await StopAsync();
+
+    private async Task AcceptLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                TcpClient client = await _listener.AcceptTcpClientAsync(ct).ConfigureAwait(false);
+                client.NoDelay = true; // 低レイテンシにしたい場合
+                var ep = client.Client.RemoteEndPoint!;
+                _clients[ep] = client;
+                Console.WriteLine($"Client connected: {ep}");
+
+                _ = HandleClientAsync(client, ct); // fire-and-forget
+            }
+        }
+        catch (OperationCanceledException) { /* stopping */ }
+        catch (ObjectDisposedException) { /* listener stopped */ }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[AcceptLoop] {ex}");
+        }
+    }
+
+    private async Task HandleClientAsync(TcpClient client, CancellationToken ct)
+    {
+        var ep = client.Client.RemoteEndPoint!;
+        using NetworkStream stream = client.GetStream();
+        byte[] buffer = new byte[4096];
+
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                int read = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
+                if (read == 0) break; // リモートがクリーンに切断
+                string msg = Encoding.UTF8.GetString(buffer, 0, read);
+                Console.WriteLine($"[{ep}] {msg}");
+
+                // 必要ならエコー
+                // await stream.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) { /* stopping */ }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[HandleClient {ep}] {ex.Message}");
+        }
+        finally
+        {
+            // ここにアプリレベルのクリーンアップ
+            try { client.Close(); } catch { /* ignore */ }
+            _clients.TryRemove(ep, out _);
+            Console.WriteLine($"Client disconnected: {ep}");
+        }
+    }
+
+    private async Task MonitorLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                foreach (var (ep, client) in _clients)
+                {
+                    if (!IsConnected(client))
+                    {
+                        Console.WriteLine($"Detected dead client: {ep}");
+                        try { client.Close(); } catch { /* ignore */ }
+                        _clients.TryRemove(ep, out _);
+                    }
+                }
+
+                await Task.Delay(_monitorInterval, ct).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) { /* stopping */ }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[MonitorLoop] {ex}");
+        }
+    }
+
+    // 非同期ではないが軽量で十分：Poll(0, Read) && Available == 0 なら切断とみなす
+    private static bool IsConnected(TcpClient client)
+    {
+        try
+        {
+            if (client is null || !client.Connected) return false;
+
+            var s = client.Client;
+            // 受信可能かつキューが空 → FIN 受信済みの可能性が高い
+            if (s.Poll(0, SelectMode.SelectRead))
+                return s.Available != 0;
+
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+}
+```
+
+### 使い方（`Main` の例）
+
+```csharp
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+
+class Program
+{
+    static async Task Main()
+    {
+        using var cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+        var server = new TcpServer(port: 5000);
+        await server.StartAsync(cts.Token);
+
+        Console.WriteLine("Press Ctrl+C to stop.");
+        try
+        {
+            // ここでサーバーが動き続ける（他の処理を並行させてもOK）
+            await Task.Delay(Timeout.Infinite, cts.Token);
+        }
+        catch (OperationCanceledException) { /* exit */ }
+
+        await server.StopAsync();
+        Console.WriteLine("Server stopped.");
+    }
+}
+```
+
+---
+
+### 補足（心拍 “PING/PONG” を入れたい場合）
+
+* `HandleClientAsync` のループとは別に `HeartbeatLoopAsync` を作り、`NetworkStream.WriteAsync` で `PING` を定期送信 → タイムアウト内に `PONG` を受け取れなければ切断扱いにします。
+* 心拍の方が **NAT タイムアウト** や **アイドル切断** に強く、実運用ではこちらを推奨です。
+
+必要なら、**心拍入り**や**クライアント側の `async` 実装**もセットで出します。
+
+とても良い質問です 👍
+
+結論から言うと：
+
+> **この `IsConnected` チェック自体は非同期化できません（意味がない or 効果が薄い）**
+> というのが正確な答えです。
+
+---
+
+## 🔍 理由
+
+### 1️⃣ `Poll` は OS レベルの同期 API
+
+`Socket.Poll()` は「カーネルに問い合わせて、受信待ち状態かどうか」を即時に返す関数で、
+**I/O をブロックしない・時間もほぼゼロ**です。
+したがって非同期化しても待機する意味がありません。
+
+```csharp
+bool ready = socket.Poll(0, SelectMode.SelectRead);
+```
+
+* OS 内部では「select(2)」システムコールが即時に実行されます。
+* これは「待つ」ではなく「今すぐ状態を教えて」動作。
+* つまり、非同期化しても「async で CPU を開放」する場面がない。
+
+→ **非同期にするコスト（Task生成）がむしろ無駄**になります。
+
+---
+
+### 2️⃣ 非同期にできるケースは「本当にI/Oを伴う場合」
+
+たとえば `stream.ReadAsync()` や `AcceptTcpClientAsync()` は、
+内部で OS の I/O 完了待ち（epoll/kqueue など）を行うので非同期化が有効です。
+
+一方、`Poll` は「待たずに即返る」チェック用関数なので async 化の恩恵はありません。
+
+---
+
+### 3️⃣ 擬似的に非同期化するなら Task.Run
+
+もし「CPU をまったくブロックしたくない」理由（たとえば数万接続を一斉チェック）があるなら、
+**非同期 I/O ではなくスレッドプール並列**が適しています。
+
+```csharp
+private static Task<bool> IsConnectedAsync(TcpClient client)
+{
+    return Task.Run(() => IsConnected(client));
+}
+```
+
+ただしこれは本質的に「並列化」であり、「I/O の非同期」ではありません。
+つまり **async/await の文法を使っているだけで、内部は同期チェック**です。
+
+---
+
+## ✅ 結論まとめ
+
+| 方法                                       | 意味                    | おすすめ度 |
+| ---------------------------------------- | --------------------- | ----- |
+| `Poll(0, SelectRead)`                    | OSが即座に状態を返す（非ブロッキング）  | ⭐⭐⭐⭐  |
+| `await IsConnectedAsync()` (Task.Runラップ) | 擬似的に非同期呼び出しにしただけ      | ⭐     |
+| 完全な非同期 I/O で生存確認                         | 不可能（TCPレイヤに“Ping”はない） | ❌     |
+
+---
+
+もし「完全に非同期で生存監視したい」なら、
+**アプリ層心拍（PING/PONG）方式**にするのが唯一の正攻法です。
+
+つまり、サーバーが `WriteAsync("PING")` → クライアントが `WriteAsync("PONG")` で返す、
+という形で「async I/O を活かした接続確認」ができます。
+
+---
+
+希望があれば、
+
+> 💓 `async/await` で動く心拍監視（PING/PONG）サンプル
+
+も出します。出してみましょうか？
+
+はい、その理解で正しいです ✅
+あなたが示したこのメソッド：
+
+```csharp
+private static bool IsConnected(TcpClient client)
+{
+    try
+    {
+        if (client is null || !client.Connected) return false;
+
+        var s = client.Client;
+        // 受信可能かつキューが空 → FIN 受信済みの可能性が高い
+        if (s.Poll(0, SelectMode.SelectRead))
+            return s.Available != 0;
+
+        return true;
+    }
+    catch
+    {
+        return false;
+    }
+}
+```
+
+は、**TCP ソケットの「切断検出」**として実運用で十分に使えます。
+ただし「100% 完璧」ではないことも理解しておくと安全です。
+
+---
+
+## ✅ このメソッドで検出できること
+
+| 状況                                | 判定結果                  | 備考                            |
+| --------------------------------- | --------------------- | ----------------------------- |
+| 相手が `Close()` や `Dispose()` で正常切断 | `false`               | TCP の FIN が届くため確実に検出可         |
+| 相手が異常終了（例：プロセスkill、OS落ち）          | 数秒後に `false`          | TCP keepalive もしくは FIN/RSTで検出 |
+| ケーブル抜け / Wi-Fi切断など物理的断線           | OSの再送タイムアウト後に `false` | 数秒〜数分かかる場合あり                  |
+| ネットワーク経路に一時的な詰まり                  | `true` のまま            | TCP的にはまだ生きている扱い               |
+
+---
+
+## ⚙️ 技術的な仕組み（なぜ判定できるのか）
+
+* `Poll(0, SelectMode.SelectRead)` が `true` → ソケットが「読み取り可能」状態
+* しかし `Available == 0` → 受信バッファにデータがない
+* これは「リモートから FIN が届いた（=相手が閉じた）」ことを意味します。
+  → OS が FIN を受け取ると、受信キューを空にして SelectRead が true になります。
+
+つまり **「受信可能かつバッファ空」= 切断済み** の確実なサインです。
+
+---
+
+## ⚠️ 注意点（限界）
+
+1. **相手がネットワーク障害などで無応答の場合**
+   　→ OSがFIN/RSTを受け取れない限り、`Poll`では死活を判定できません。
+   　→ これはTCPプロトコルの仕様上避けられません。
+
+2. **長時間アイドル状態**
+   　→ OSやNATルータによって切断されることもあるため、
+   　　**定期的な送信（心拍）**を組み合わせるのが安全策です。
+
+---
+
+## 💡 結論
+
+* この `IsConnected()` は
+  　**「相手が正常/異常に切断したか」を即時に検出できる最も軽量な方法**
+  　です。
+* ただし、**物理断線やネット障害での“見かけ上の生存”**までは防げません。
+* 実運用では：
+
+  * 軽いアプリ層の ping（`PING/PONG`）
+  * もしくは OS の TCP KeepAlive（`socket.SetSocketOption`）
+    　を併用すれば「ほぼ確実な死活監視」ができます。
+
+---
+
+必要であれば、
+👉 この `IsConnected` に加えて **TCP KeepAlive を有効化するコード例**
+（タイムアウト時間の指定付き）を出すこともできます。
+出してみましょうか？
+
+了解です 👍
+それでは、`TcpClient`／`Socket` に **TCP KeepAlive（キープアライブ）** を有効化する方法と、実践的な設定例を紹介します。
+
+---
+
+## 💡 TCP KeepAlive とは
+
+TCPレベルで「相手がまだ生きているか」を **OSが自動で確認する仕組み** です。
+ユーザーアプリが `PING` を送らなくても、カーネルが一定間隔で小さなパケットを送って応答を確認します。
+
+これにより：
+
+* 相手が異常終了していても早めに検出できる
+* ネットワーク障害などで“見かけ上つながっている”状態を減らせる
+
+---
+
+## ✅ 実装例：`TcpClient` に KeepAlive を設定する
+
+```csharp
+using System;
+using System.Net.Sockets;
+
+public static class TcpClientExtensions
+{
+    /// <summary>
+    /// TCP KeepAlive を有効化し、タイミングを設定する。
+    /// </summary>
+    /// <param name="client">対象の TcpClient</param>
+    /// <param name="keepAliveTime">最初の無通信から何ミリ秒で送るか（例：5000ms）</param>
+    /// <param name="keepAliveInterval">再送間隔（例：1000ms）</param>
+    /// <param name="keepAliveRetryCount">再送回数（Windowsでは省略可）</param>
+    public static void SetKeepAlive(this TcpClient client, uint keepAliveTime = 5000, uint keepAliveInterval = 1000, uint keepAliveRetryCount = 3)
+    {
+        var socket = client.Client;
+
+        // TCP KeepAlive を有効化
+        socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+
+        // Windows専用：IOControl で詳細設定
+        // Linux/macOS は OS 設定に従うため、このコードはスキップ可
+        try
+        {
+            byte[] inOptionValues = new byte[12];
+            BitConverter.GetBytes((uint)(keepAliveTime != 0 ? 1u : 0u)).CopyTo(inOptionValues, 0); // 有効化
+            BitConverter.GetBytes(keepAliveTime).CopyTo(inOptionValues, 4);     // 初回送信までの無通信時間(ms)
+            BitConverter.GetBytes(keepAliveInterval).CopyTo(inOptionValues, 8); // 再送間隔(ms)
+
+            socket.IOControl(IOControlCode.KeepAliveValues, inOptionValues, null);
+        }
+        catch (PlatformNotSupportedException)
+        {
+            // macOS / Linux 環境など IOControl 未実装の場合
+        }
+    }
+}
+```
+
+---
+
+## ⚙️ 使用例
+
+```csharp
+var client = new TcpClient();
+await client.ConnectAsync("127.0.0.1", 5000);
+
+// 5秒間無通信なら1秒おきにKeepAlive送信
+client.SetKeepAlive(keepAliveTime: 5000, keepAliveInterval: 1000);
+```
+
+これで OS が自動的に一定間隔で KeepAlive パケットを送り、
+相手が応答しなければ数秒後にソケットがエラーを返すようになります。
+
+---
+
+## 🧠 動作概要（Windowsの既定）
+
+| 設定項目                | 既定値（未設定時）       | 説明                  |
+| ------------------- | --------------- | ------------------- |
+| KeepAliveTime       | 7200000 ms（2時間） | 最初の無通信から送るまでの時間     |
+| KeepAliveInterval   | 1000 ms         | 再送間隔                |
+| KeepAliveRetryCount | 5回程度            | 応答なしで接続切断になるまでの試行回数 |
+
+→ つまり、**デフォルトのままだと2時間放置しないと切断を検出しない** ため、
+リアルタイム通信では必ず短く設定すべきです。
+
+---
+
+## 🚀 実運用のおすすめ設定
+
+| 用途            | KeepAliveTime | KeepAliveInterval | 説明             |
+| ------------- | ------------- | ----------------- | -------------- |
+| ローカル通信（社内LAN） | 5秒            | 1秒                | 切断検出を高速化       |
+| インターネット通信     | 30秒           | 5秒                | 不安定回線でも誤判定しにくい |
+| IoT / 組込み用途   | 60秒           | 10秒               | 電力・通信量節約重視     |
+
+---
+
+## ✅ まとめ
+
+| 方法                    | 判定対象        | 特徴               |
+| --------------------- | ----------- | ---------------- |
+| `Poll(0, SelectRead)` | ソケットのローカル状態 | 即時チェック（軽量）       |
+| TCP KeepAlive         | OSによる物理死活確認 | ネットワーク断・異常終了も検出可 |
+| PING/PONG             | アプリ層        | 最も柔軟（論理死活も検出可）   |
+
+→ **`IsConnected()` + `SetKeepAlive()` の併用がベストプラクティス** です。
+`Poll` で即時検出、KeepAlive で確実検出の両輪になります。
+
+---
+
+ご希望があれば次に、
+🧩「クライアント側も KeepAlive 有効で接続する `async` 実装例」
+（`TcpClient.ConnectAsync`＋`SetKeepAlive`）もお見せできます。
+出してみましょうか？
+
+了解です 👍
+それでは、クライアント側で **`async/await` ＋ TCP KeepAlive 有効化済み** の実装例を紹介します。
+これで「非同期接続」「切断検出」「再接続耐性」を兼ね備えた堅牢なクライアントになります。
+
+---
+
+## 💻 非同期クライアント実装例
+
+```csharp
+using System;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+class TcpClientWithKeepAlive : IAsyncDisposable
+{
+    private readonly string _host;
+    private readonly int _port;
+    private TcpClient? _client;
+    private NetworkStream? _stream;
+    private readonly CancellationTokenSource _cts = new();
+
+    public TcpClientWithKeepAlive(string host, int port)
+    {
+        _host = host;
+        _port = port;
+    }
+
+    public async Task ConnectAsync()
+    {
+        _client = new TcpClient();
+        await _client.ConnectAsync(_host, _port);
+        _client.SetKeepAlive(keepAliveTime: 5000, keepAliveInterval: 1000); // 🔧 KeepAlive 有効化
+        _stream = _client.GetStream();
+
+        Console.WriteLine($"Connected to {_host}:{_port}");
+
+        // 受信ループをバックグラウンドで開始
+        _ = ReceiveLoopAsync(_cts.Token);
+    }
+
+    public async Task SendAsync(string message)
+    {
+        if (_stream == null) throw new InvalidOperationException("Not connected.");
+
+        byte[] buffer = Encoding.UTF8.GetBytes(message);
+        await _stream.WriteAsync(buffer);
+    }
+
+    private async Task ReceiveLoopAsync(CancellationToken ct)
+    {
+        byte[] buffer = new byte[4096];
+
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                int bytesRead = await _stream!.ReadAsync(buffer, ct);
+                if (bytesRead == 0)
+                {
+                    Console.WriteLine("Server closed connection.");
+                    break;
+                }
+
+                string msg = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                Console.WriteLine($"[Server] {msg}");
+            }
+        }
+        catch (OperationCanceledException) { /* graceful stop */ }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ReceiveLoop] Error: {ex.Message}");
+        }
+
+        await ReconnectAsync();
+    }
+
+    private async Task ReconnectAsync()
+    {
+        Console.WriteLine("Reconnecting...");
+        await Task.Delay(3000);
+
+        try
+        {
+            await ConnectAsync();
+            Console.WriteLine("Reconnected successfully.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Reconnect failed: {ex.Message}");
+            await Task.Delay(5000);
+            await ReconnectAsync(); // 再試行
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _cts.Cancel();
+        _stream?.Dispose();
+        _client?.Close();
+        await Task.CompletedTask;
+    }
+}
+```
+
+---
+
+## ⚙️ 使用例
+
+```csharp
+class Program
+{
+    static async Task Main()
+    {
+        using var client = new TcpClientWithKeepAlive("127.0.0.1", 5000);
+
+        await client.ConnectAsync();
+
+        Console.WriteLine("Type messages to send. Ctrl+C to exit.");
+
+        while (true)
+        {
+            string? input = Console.ReadLine();
+            if (string.IsNullOrEmpty(input)) continue;
+
+            await client.SendAsync(input);
+        }
+    }
+}
+```
+
+---
+
+## 🧠 補足
+
+| 機能                 | 説明                            |
+| ------------------ | ----------------------------- |
+| `SetKeepAlive()`   | OS レベルの TCP KeepAlive パケットを送信 |
+| `async/await`      | I/O 非同期化でスケーラブル               |
+| `ReconnectAsync()` | 接続断検出時に自動再接続                  |
+| `DisposeAsync()`   | クリーンな終了処理                     |
+
+---
+
+## ✅ これで得られるメリット
+
+* **OS レベルで死活監視**（相手が異常終了したら自動的に検出）
+* **アプリ側で非同期送受信** → UIスレッドや他処理をブロックしない
+* **再接続ループ** により、ネットワーク断も自動復旧
+
+---
+
+もし次に進めるなら、
+
+> 💓 `PING/PONG` でアプリ層の心拍確認を追加するバージョン（async対応）
+
+も組み合わせて出せます。
+これで「OS + アプリ層の両レベルで死活監視」になる、実運用レベルの仕組みです。
+出してみますか？
+
+了解！`async/await` で **アプリ層の心拍（PING/PONG）** を実装したサーバー＆クライアントの最小構成を用意しました。
+TCP KeepAlive との併用で、**OSレベル＋アプリレベル**の二重監視になります。
+
+---
+
+# サーバー（`TcpListener` + PING/PONG + タイムアウト）
+
+* 一定間隔で `PING\n` を送信
+* クライアントから `PONG`（または通常メッセージの受信）があれば生存とみなす
+* `heartbeatTimeout` を超えて応答がなければ切断
+* 文字列は **行区切り（\n）** の簡易プロトコル
+
+```csharp
+using System;
+using System.Buffers;
+using System.Collections.Concurrent;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+public sealed class HeartbeatTcpServer : IAsyncDisposable
+{
+    private readonly TcpListener _listener;
+    private readonly ConcurrentDictionary<EndPoint, ClientSession> _clients = new();
+    private readonly TimeSpan _heartbeatInterval;
+    private readonly TimeSpan _heartbeatTimeout;
+    private CancellationTokenSource? _cts;
+    private Task? _acceptTask;
+
+    public HeartbeatTcpServer(
+        int port,
+        TimeSpan? heartbeatInterval = null,
+        TimeSpan? heartbeatTimeout = null)
+    {
+        _listener = new TcpListener(IPAddress.Any, port);
+        _heartbeatInterval = heartbeatInterval ?? TimeSpan.FromSeconds(10);
+        _heartbeatTimeout = heartbeatTimeout ?? TimeSpan.FromSeconds(30);
+    }
+
+    public async Task StartAsync(CancellationToken cancellationToken = default)
+    {
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _listener.Start();
+        Console.WriteLine("Server started.");
+        _acceptTask = AcceptLoopAsync(_cts.Token);
+        await Task.CompletedTask;
+    }
+
+    public async Task StopAsync()
+    {
+        if (_cts is null) return;
+        _cts.Cancel();
+        _listener.Stop();
+
+        foreach (var (_, s) in _clients)
+        {
+            try { await s.DisposeAsync(); } catch { /* ignore */ }
+        }
+        if (_acceptTask is not null)
+        {
+            try { await _acceptTask; } catch { /* ignore */ }
+        }
+    }
+
+    public async ValueTask DisposeAsync() => await StopAsync();
+
+    private async Task AcceptLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                var client = await _listener.AcceptTcpClientAsync(ct).ConfigureAwait(false);
+                client.NoDelay = true;
+
+                // 任意：OSのTCP KeepAlive（早期検出・NAT越えの安定化）
+                TryEnableKeepAlive(client, keepAliveTimeMs: 30_000, keepAliveIntervalMs: 5_000);
+
+                var session = new ClientSession(client, _heartbeatInterval, _heartbeatTimeout, RemoveClient, ct);
+                _clients[client.Client.RemoteEndPoint!] = session;
+                Console.WriteLine($"Client connected: {client.Client.RemoteEndPoint}");
+                _ = session.RunAsync(); // fire-and-forget
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (ObjectDisposedException) { }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[AcceptLoop] {ex}");
+        }
+    }
+
+    private void RemoveClient(EndPoint ep)
+    {
+        _clients.TryRemove(ep, out _);
+        Console.WriteLine($"Client removed: {ep}");
+    }
+
+    private static void TryEnableKeepAlive(TcpClient client, uint keepAliveTimeMs, uint keepAliveIntervalMs)
+    {
+        try
+        {
+            var s = client.Client;
+            s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+            // Windows の詳細設定
+            byte[] inOption = new byte[12];
+            BitConverter.GetBytes(1u).CopyTo(inOption, 0);
+            BitConverter.GetBytes(keepAliveTimeMs).CopyTo(inOption, 4);
+            BitConverter.GetBytes(keepAliveIntervalMs).CopyTo(inOption, 8);
+            s.IOControl(IOControlCode.KeepAliveValues, inOption, null);
+        }
+        catch { /* 未対応OSは黙ってスキップ */ }
+    }
+
+    private sealed class ClientSession : IAsyncDisposable
+    {
+        private readonly TcpClient _client;
+        private readonly NetworkStream _ns;
+        private readonly StreamReader _reader;
+        private readonly StreamWriter _writer;
+        private readonly TimeSpan _interval;
+        private readonly TimeSpan _timeout;
+        private readonly Action<EndPoint> _onClose;
+        private readonly CancellationToken _serverCt;
+
+        private DateTime _lastSeenUtc;
+        private readonly EndPoint _ep;
+
+        public ClientSession(
+            TcpClient client,
+            TimeSpan interval,
+            TimeSpan timeout,
+            Action<EndPoint> onClose,
+            CancellationToken serverCt)
+        {
+            _client = client;
+            _ns = client.GetStream();
+            _reader = new StreamReader(_ns, new UTF8Encoding(false), detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true);
+            _writer = new StreamWriter(_ns, new UTF8Encoding(false)) { AutoFlush = true };
+            _interval = interval;
+            _timeout = timeout;
+            _onClose = onClose;
+            _serverCt = serverCt;
+            _lastSeenUtc = DateTime.UtcNow;
+            _ep = _client.Client.RemoteEndPoint!;
+        }
+
+        public async Task RunAsync()
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(_serverCt);
+            var ct = cts.Token;
+
+            var recv = ReceiveLoopAsync(ct);
+            var hb = HeartbeatLoopAsync(ct);
+
+            try
+            {
+                await Task.WhenAny(recv, hb).ConfigureAwait(false);
+            }
+            finally
+            {
+                cts.Cancel();
+                try { await Task.WhenAll(Suppress(recv), Suppress(hb)); } catch { }
+                await DisposeAsync();
+                _onClose(_ep);
+            }
+        }
+
+        private async Task ReceiveLoopAsync(CancellationToken ct)
+        {
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    // .NET 6+ : ReadLineAsync を WaitAsync でキャンセル可能に
+                    var line = await _reader.ReadLineAsync().WaitAsync(ct).ConfigureAwait(false);
+                    if (line is null) break; // FIN 受信など
+
+                    _lastSeenUtc = DateTime.UtcNow;
+
+                    if (line == "PING")
+                    {
+                        await _writer.WriteLineAsync("PONG").ConfigureAwait(false);
+                        continue;
+                    }
+
+                    if (line == "PONG")
+                    {
+                        // 心拍応答。特に処理不要
+                        continue;
+                    }
+
+                    // アプリメッセージ：ここで処理。例はエコー
+                    Console.WriteLine($"[{_ep}] {line}");
+                    await _writer.WriteLineAsync($"ECHO: {line}").ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (IOException) { } // 切断等
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Recv {_ep}] {ex.Message}");
+            }
+        }
+
+        private async Task HeartbeatLoopAsync(CancellationToken ct)
+        {
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    // 送信（サーバー主導）
+                    await _writer.WriteLineAsync("PING").ConfigureAwait(false);
+
+                    // タイムアウト判定
+                    var until = DateTime.UtcNow + _timeout;
+                    while (DateTime.UtcNow < until && !ct.IsCancellationRequested)
+                    {
+                        await Task.Delay(TimeSpan.FromMilliseconds(200), ct).ConfigureAwait(false);
+                        if (DateTime.UtcNow - _lastSeenUtc < _timeout)
+                            break;
+                    }
+
+                    if (DateTime.UtcNow - _lastSeenUtc >= _timeout)
+                    {
+                        Console.WriteLine($"[Heartbeat] timeout: {_ep}");
+                        break; // 切断
+                    }
+
+                    await Task.Delay(_interval, ct).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (IOException) { }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Heartbeat {_ep}] {ex.Message}");
+            }
+        }
+
+        private static async Task Suppress(Task t)
+        {
+            try { await t; } catch { }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            try { _writer.Dispose(); } catch { }
+            try { _reader.Dispose(); } catch { }
+            try { _ns.Dispose(); } catch { }
+            try { _client.Close(); } catch { }
+            await Task.CompletedTask;
+        }
+    }
+}
+```
+
+## 実行用 `Main`
+
+```csharp
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+
+class Program
+{
+    static async Task Main()
+    {
+        using var cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+        var server = new HeartbeatTcpServer(
+            port: 5000,
+            heartbeatInterval: TimeSpan.FromSeconds(10),
+            heartbeatTimeout:  TimeSpan.FromSeconds(30));
+
+        await server.StartAsync(cts.Token);
+
+        Console.WriteLine("Server running. Ctrl+C to stop.");
+        try { await Task.Delay(Timeout.Infinite, cts.Token); }
+        catch (OperationCanceledException) { }
+
+        await server.StopAsync();
+        Console.WriteLine("Server stopped.");
+    }
+}
+```
+
+---
+
+# クライアント（`TcpClient` + 自動PONG + 再接続）
+
+* サーバーから `PING` を受けたら即 `PONG` を返す
+* アプリメッセージはそのまま表示
+* 切断検出で **自動再接続**（指数バックオフの簡易版）
+* KeepAlive も有効化
+
+```csharp
+using System;
+using System.IO;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+public sealed class HeartbeatTcpClient : IAsyncDisposable
+{
+    private readonly string _host;
+    private readonly int _port;
+    private TcpClient? _client;
+    private NetworkStream? _ns;
+    private StreamReader? _reader;
+    private StreamWriter? _writer;
+    private readonly CancellationTokenSource _cts = new();
+
+    public HeartbeatTcpClient(string host, int port)
+    {
+        _host = host;
+        _port = port;
+    }
+
+    public async Task ConnectAsync()
+    {
+        _client = new TcpClient();
+        await _client.ConnectAsync(_host, _port);
+        _client.NoDelay = true;
+
+        // OS の TCP KeepAlive（任意）
+        TryEnableKeepAlive(_client, 30_000, 5_000);
+
+        _ns = _client.GetStream();
+        _reader = new StreamReader(_ns, new UTF8Encoding(false), false, 4096, leaveOpen: true);
+        _writer = new StreamWriter(_ns, new UTF8Encoding(false)) { AutoFlush = true };
+
+        Console.WriteLine($"Connected to {_host}:{_port}");
+        _ = ReceiveLoopAsync(_cts.Token); // fire-and-forget
+    }
+
+    public async Task SendAsync(string line)
+    {
+        if (_writer is null) throw new InvalidOperationException("Not connected.");
+        await _writer.WriteLineAsync(line);
+    }
+
+    private async Task ReceiveLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                var line = await _reader!.ReadLineAsync().WaitAsync(ct).ConfigureAwait(false);
+                if (line is null) break;
+
+                if (line == "PING")
+                {
+                    await _writer!.WriteLineAsync("PONG").ConfigureAwait(false);
+                    continue;
+                }
+
+                Console.WriteLine($"[Server] {line}");
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (IOException) { }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Client Receive] {ex.Message}");
+        }
+
+        await ReconnectLoopAsync();
+    }
+
+    private async Task ReconnectLoopAsync()
+    {
+        int delayMs = 1000;
+        while (!_cts.IsCancellationRequested)
+        {
+            Console.WriteLine($"Reconnecting in {delayMs} ms...");
+            try { await Task.Delay(delayMs, _cts.Token); } catch { return; }
+
+            try
+            {
+                await ConnectAsync();
+                Console.WriteLine("Reconnected.");
+                return;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Reconnect failed: {ex.Message}");
+                delayMs = Math.Min(delayMs * 2, 15_000); // 簡易指数バックオフ
+            }
+        }
+    }
+
+    private static void TryEnableKeepAlive(TcpClient client, uint keepAliveTimeMs, uint keepAliveIntervalMs)
+    {
+        try
+        {
+            var s = client.Client;
+            s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+            byte[] inOption = new byte[12];
+            BitConverter.GetBytes(1u).CopyTo(inOption, 0);
+            BitConverter.GetBytes(keepAliveTimeMs).CopyTo(inOption, 4);
+            BitConverter.GetBytes(keepAliveIntervalMs).CopyTo(inOption, 8);
+            s.IOControl(IOControlCode.KeepAliveValues, inOption, null);
+        }
+        catch { }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _cts.Cancel();
+        try { _writer?.Dispose(); } catch { }
+        try { _reader?.Dispose(); } catch { }
+        try { _ns?.Dispose(); } catch { }
+        try { _client?.Close(); } catch { }
+        await Task.CompletedTask;
+    }
+}
+```
+
+## クライアント実行例
+
+```csharp
+using System;
+using System.Threading.Tasks;
+
+class Program
+{
+    static async Task Main()
+    {
+        await using var client = new HeartbeatTcpClient("127.0.0.1", 5000);
+        await client.ConnectAsync();
+
+        Console.WriteLine("Type messages to send. Ctrl+C to exit.");
+        while (true)
+        {
+            var line = Console.ReadLine();
+            if (string.IsNullOrEmpty(line)) continue;
+            await client.SendAsync(line);
+        }
+    }
+}
+```
+
+---
+
+## 運用メモ
+
+* **タイムアウト設計**：`heartbeatInterval` は 10–30 秒、`heartbeatTimeout` は 2～3 回分（例：30–90 秒）を目安に。
+* **混雑・遅延耐性**：アプリ層心拍は遅延で誤検知し得るため、**2回以上のミス**で切断扱いにしてもOK（上記コードは時間で判定）。
+* **プロトコル拡張**：行区切りで十分ですが、必要に応じて長さプレフィクス（Length-Prefix）やJSON/RPCに拡張できます。
+* **追加の即時判定**：サーバー側で `Poll(0, Read) && Available == 0` を併用すると、FIN 受信時の即時検出が可能。
+
+---
+
+必要なら、この心拍プロトコルを **バイナリ長さプレフィクス方式** にした堅牢版（Nagle/粘着対策・部分読み取り対応）も用意できます。

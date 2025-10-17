@@ -1,0 +1,1104 @@
+理解しました。要は「数百台の Windows サーバーに入っている自作サービスの状態を、**速く・堅牢に**集計したい。直列だと遅いし、CPU100%なマシンに引っ張られて詰むのを避けたい」という要件ですね。
+
+やるべきことはシンプルに2方向あります。必要なら両方使い分けを。
+
+# アプローチA（Pull型）：一括並列ポーリング + タイムアウト + バックオフ
+
+監視側から**並列に**各サーバーへ問い合わせます。**必ず per-host タイムアウト**を付け、**並列数を制限**します。タイムアウトは「問題あり」と見なすので、CPU100%で固まっていても全体が止まりません。
+
+## 主要ポイント
+
+* `Parallel.ForEachAsync`（.NET 6+）や `SemaphoreSlim` で**最大並列数**（例: 64〜128）を制限
+* **per-host タイムアウト（例: 2〜5秒）**を徹底。応答なし＝`Timeout/Unhealthy`
+* **リトライ**は1回程度（ネットワーク瞬断対策）
+* 取得手段は好きなものを：
+
+  * ① `ServiceController`（RPC/SCM；シンプルだが時々遅い）
+  * ② **WMI/CIM (Win32_Service)**（タイムアウトが付けやすい）
+  * ③ あなたの**自作サービスに軽いHTTP/TCP `/health`**を追加（最速・安定）
+
+### サンプル（WMIで状態取得・並列）
+
+```csharp
+using System;
+using System.Collections.Concurrent;
+using System.Linq;
+using System.Management; // System.Management の参照を追加
+using System.Threading;
+using System.Threading.Tasks;
+
+public static class ServiceSurvey
+{
+    public static async Task<ConcurrentDictionary<string, string>> QueryAsync(
+        string[] hosts,
+        string serviceName,
+        TimeSpan perHostTimeout,
+        int maxDegreeOfParallelism = 64,
+        CancellationToken ct = default)
+    {
+        var results = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        await Parallel.ForEachAsync(hosts, new ParallelOptions
+        {
+            MaxDegreeOfParallelism = maxDegreeOfParallelism,
+            CancellationToken = ct
+        }, async (host, token) =>
+        {
+            var status = await QueryOneWithTimeout(host, serviceName, perHostTimeout, token);
+            results[host] = status;
+        });
+
+        return results;
+    }
+
+    private static async Task<string> QueryOneWithTimeout(string host, string serviceName, TimeSpan timeout, CancellationToken ct)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(timeout);
+
+        try
+        {
+            return await Task.Run(() =>
+            {
+                // WMI: \\<host>\root\cimv2 から Win32_Service を問い合わせ
+                var scope = new ManagementScope($@"\\{host}\root\cimv2");
+                scope.Connect(); // 認証が必要なら ConnectionOptions を使用
+
+                var query = new ObjectQuery($"SELECT State, Status, StartMode FROM Win32_Service WHERE Name='{serviceName.Replace("'", "''")}'");
+                using var searcher = new ManagementObjectSearcher(scope, query)
+                {
+                    Options = new EnumerationOptions
+                    {
+                        Timeout = timeout, // ここにもタイムアウト
+                        Rewindable = false,
+                        ReturnImmediately = true
+                    }
+                };
+
+                using var col = searcher.Get();
+                var svc = col.Cast<ManagementObject>().FirstOrDefault();
+                if (svc == null) return "NotFound";
+
+                string state = (string)svc["State"];     // "Running","Stopped","Paused",...
+                string status = (string)(svc["Status"] ?? "Unknown");
+                string startMode = (string)(svc["StartMode"] ?? "Unknown");
+                return $"{state}|{status}|StartMode={startMode}";
+            }, cts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return "Timeout";
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return "AuthError";
+        }
+        catch (Exception ex)
+        {
+            return $"Error:{ex.GetType().Name}";
+        }
+    }
+}
+```
+
+> 使い方
+>
+> ```csharp
+> var hosts = File.ReadAllLines("hosts.txt"); // サーバー名/IP一覧
+> var res = await ServiceSurvey.QueryAsync(hosts, "MyService", TimeSpan.FromSeconds(3), maxDegreeOfParallelism: 96);
+> // res[host] に "Running|OK|StartMode=Auto" などが入る。 "Timeout" は問題扱いにできる。
+> ```
+
+**CPU100%で固まったサーバー**は `Timeout` として早めに切り捨てられ、全体進行は止まりません。
+**並列数**はネットワークと管理サーバーの余裕に合わせて調整してください（64〜256の間でチューニング）。
+
+> 備考：`ServiceController` を使う場合はリモートRPCの待ちが長引くことがあるので、**必ず Task.Run + CancelAfter** でガードしてください。WMI/CIMの方がタイムアウト制御は楽です。
+> 認証が必要なら `ConnectionOptions` で資格情報を渡せます。
+
+---
+
+# アプローチB（Push型）：各サーバーから**中央へ心拍送信**
+
+Pullだと監視側が**全台に接続**する必要があり、RPCやWMIのツラミに引きずられます。
+あなたの自作サービスに**心拍（例：HTTP POST / UDPビーコン）**を実装すれば、監視は**集計だけ**になります。
+
+## 仕組み
+
+* 各サーバー上の自作サービスが **N秒ごとに中央(HTTP/HTTPS)** に JSON をPOST：
+
+  * `{ host, service: "MyService", status: "Running", startedAt, cpu, mem, ts }`
+* 中央は **到着時刻の鮮度**で健全性を判定：
+
+  * 例）**最後の心拍が60秒超未達 → Unhealthy**（CPU100%で固まっても自然に検出）
+* Pull不要。中央は**DBに upsert**し、画面やCSV出力で一覧化
+
+### 最小の心拍例（サービス側・疑似）
+
+```csharp
+var http = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
+while (true)
+{
+    var payload = new
+    {
+        host = Environment.MachineName,
+        service = "MyService",
+        status = GetOwnServiceStatus(), // Running/Paused/Stopped など
+        ts = DateTimeOffset.UtcNow
+    };
+    try { await http.PostAsJsonAsync("https://monitor.example.com/beat", payload); }
+    catch { /* 無視・次回 */ }
+
+    await Task.Delay(TimeSpan.FromSeconds(10));
+}
+```
+
+> **長所**
+>
+> * **スケール**する（数百〜数千台OK）
+> * **逆方向の詰まりがない**（中央は受けるだけ。タイムアウトで判定できる）
+> * 監視間隔を短くしやすい
+>   **短所**
+> * 既存サービスに小改修が必要（送信コードの組み込み）
+
+---
+
+# どれを選ぶべき？
+
+* **すぐ改善したい**：まず **アプローチA（Pull並列＋タイムアウト）** を導入。
+
+  * 並列数を増やす ⇒ 所要時間はほぼ `台数 / 並列数 × タイムアウト` に収束
+  * 典型：300台 / 并列96 / タイムアウト3s ⇒ **概ね 10秒台**
+* **根本的にスケール＆安定**：中長期は **アプローチB（Push心拍）** へ。
+
+  * “応答しない＝不健康”が明快になり、Pullの遅延・不確実性から解放されます。
+
+---
+
+# 追加のプロTIP
+
+* **スロットリング**：同一拠点/サブネット単位で開始時刻をランダム化（突発負荷を回避）
+* **回線劣化対策**：Pull時は**短いDNSキャッシュ**や**ConnectTimeout**も設定
+* **しきい値**：`Running` 以外＋`Timeout`は**即アラート**でOK。`Paused`は運用方針次第
+* **復旧**：サービス側の**Service Recovery**（自動再起動）も設定（SC Managerの失敗動作）
+
+---
+
+必要なら、
+
+* Pull版の**CSV出力/HTMLダッシュボード**
+* Push版の**ミニ集中サーバー（ASP.NET Minimal API）**
+* 認証付き（APIキー）
+  までまとめて雛形を書きます。どちらで進めますか？
+
+いいね、やろう！
+下の修正版は
+
+* **入力順でのプログレス表示**（完了した順ではなく *hosts.txt の並び順* に逐次出力）
+* **CPU/メモリの取得**（ホスト全体の使用率＋対象サービスのプロセスのCPU%とメモリ使用量）
+
+を一発で入れてあります。WMI（`System.Management`）だけで完結します。
+
+---
+
+# 使い方（変わらず）
+
+```bash
+dotnet run -- \
+  --service MyService \
+  --hosts hosts.txt \
+  --degree 96 \
+  --timeout 3s \
+  --retries 1 \
+  --csv out.csv
+```
+
+---
+
+# 追加で取れるメトリクス
+
+* **ホスト全体**
+
+  * `HostCpu%` … `Win32_PerfFormattedData_PerfOS_Processor` (`_Total`)
+  * `HostMem%` … `Win32_OperatingSystem`（Total/Freeから算出）
+* **対象サービスのプロセス（PID）**
+
+  * `ProcCpu%` … `Win32_PerfFormattedData_PerfProc_Process`（`IDProcess`で紐付け）
+  * `ProcWS(MB)` … WorkingSet（MB換算）
+
+> 注: `Win32_PerfFormattedData_*` は**フォーマット済み**カウンターなので**単発取得で%が出ます**（2回サンプリング不要）。
+
+---
+
+# Program.cs（差し替え版：要点だけでもOK・そのまま貼って動きます）
+
+> NuGet: `System.Management`, `System.CommandLine`
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Collections.Concurrent;
+using System.CommandLine;
+using System.CommandLine.Invocation;
+using System.Globalization;
+using System.Linq;
+using System.Management; // NuGet: System.Management
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.IO;
+
+public class Program
+{
+    public static async Task<int> Main(string[] args)
+    {
+        var serviceOpt = new Option<string>("--service", "監視するサービス名") { IsRequired = true };
+        var hostsOpt   = new Option<string>("--hosts",   () => "hosts.txt", "ホスト一覧ファイル(1行1ホスト)");
+        var degOpt     = new Option<int>("--degree",     () => 96, "最大並列数");
+        var timeoutOpt = new Option<string>("--timeout", () => "3s", "1台あたりタイムアウト(例: 3s, 1500ms)");
+        var retriesOpt = new Option<int>("--retries",    () => 1, "失敗時のリトライ回数");
+        var csvOpt     = new Option<string?>("--csv",    description: "CSV出力パス（省略可）");
+
+        var root = new RootCommand("Windowsサービスの並列死活サーベイ（WMI / Win32_Service）＋入力順プログレス＋CPU/メモリ");
+        root.AddOptions(new[] { serviceOpt, hostsOpt, degOpt, timeoutOpt, retriesOpt, csvOpt });
+
+        root.SetHandler(async (InvocationContext ctx) =>
+        {
+            var svcName  = ctx.ParseResult.GetValueForOption(serviceOpt)!;
+            var hostsFile= ctx.ParseResult.GetValueForOption(hostsOpt)!;
+            var degree   = ctx.ParseResult.GetValueForOption(degOpt);
+            var timeoutS = ctx.ParseResult.GetValueForOption(timeoutOpt)!;
+            var retries  = Math.Max(0, ctx.ParseResult.GetValueForOption(retriesOpt));
+            var csvPath  = ctx.ParseResult.GetValueForOption(csvOpt);
+
+            TimeSpan perHostTimeout = ParseDuration(timeoutS);
+
+            if (!File.Exists(hostsFile))
+            {
+                Console.Error.WriteLine($"hostsファイルが見つかりません: {hostsFile}");
+                ctx.ExitCode = 2; return;
+            }
+
+            var hosts = File.ReadAllLines(hostsFile)
+                            .Select(x => x.Trim())
+                            .Where(x => !string.IsNullOrWhiteSpace(x) && !x.StartsWith("#"))
+                            .Distinct(StringComparer.OrdinalIgnoreCase)
+                            .ToArray();
+
+            if (hosts.Length == 0)
+            {
+                Console.Error.WriteLine("hostsが空です。");
+                ctx.ExitCode = 2; return;
+            }
+
+            Console.WriteLine($"Targets: {hosts.Length}台  Service='{svcName}'  Degree={degree}  Timeout={perHostTimeout}  Retries={retries}");
+            Console.WriteLine("--------------------------------------------------------------------------------");
+
+            using var cts = new CancellationTokenSource();
+            Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+            // 入力順の結果バッファ
+            var results = new HostResult[hosts.Length];
+
+            // 入力順プログレッサ
+            var printer = new OrderedProgressPrinter(hosts);
+
+            // 並列取得（完了ごとに in-order 出力）
+            await ServiceSurvey.QueryAsync(
+                hosts: hosts,
+                serviceName: svcName,
+                perHostTimeout: perHostTimeout,
+                maxDegreeOfParallelism: degree,
+                retries: retries,
+                ct: cts.Token,
+                onCompleted: (index, result) =>
+                {
+                    results[index] = result;
+                    printer.TryPrintReady(results); // 入力順で出力を進める
+                });
+
+            // 行区切りの終端
+            printer.FlushPending(results);
+
+            // === SUMMARY ===
+            Console.WriteLine("\n=== SUMMARY ===");
+            foreach (var g in results.GroupBy(r => r.Status).OrderByDescending(g => g.Count()))
+                Console.WriteLine($"{g.Key,-12}: {g.Count()}");
+
+            // === CSV ===
+            if (!string.IsNullOrEmpty(csvPath))
+            {
+                await CsvWriter.WriteAsync(csvPath!, results);
+                Console.WriteLine($"\nCSV: {csvPath}");
+            }
+
+            ctx.ExitCode = 0;
+        });
+
+        return await root.InvokeAsync(args);
+    }
+
+    static TimeSpan ParseDuration(string s)
+    {
+        s = s.Trim().ToLowerInvariant();
+        if (s.EndsWith("ms") && int.TryParse(s[..^2], out var ms)) return TimeSpan.FromMilliseconds(ms);
+        if (s.EndsWith("s")  && double.TryParse(s[..^1], NumberStyles.Any, CultureInfo.InvariantCulture, out var sec)) return TimeSpan.FromSeconds(sec);
+        if (double.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out var fallbackSec)) return TimeSpan.FromSeconds(fallbackSec);
+        throw new ArgumentException($"タイムアウト形式が不正です: {s}");
+    }
+}
+
+// 入力順で逐次出力するヘルパ
+public sealed class OrderedProgressPrinter
+{
+    private readonly string[] _hosts;
+    private int _nextIndexToPrint = 0;
+    private readonly object _gate = new();
+
+    public OrderedProgressPrinter(string[] hosts) => _hosts = hosts;
+
+    public void TryPrintReady(HostResult[] results)
+    {
+        lock (_gate)
+        {
+            while (_nextIndexToPrint < results.Length && results[_nextIndexToPrint] is not null)
+            {
+                var r = results[_nextIndexToPrint]!;
+                Console.WriteLine($"{_nextIndexToPrint+1,4}/{results.Length,-4}  {r.Host,-28}  {r.Status,-8}  {r.Detail}");
+                _nextIndexToPrint++;
+            }
+        }
+    }
+
+    public void FlushPending(HostResult[] results) => TryPrintReady(results);
+}
+
+// 取得結果の型（CPU/メモリ追加）
+public record HostResult(
+    string Host,
+    string Status,     // Running / Down / Pending / Timeout / Error / AuthError / NotFound / Unknown
+    string Detail,     // State|Status|StartMode|ExitCode|HostCpu=..|HostMem=..|ProcCpu=..|ProcWS=..
+    double? HostCpuPercent = null,
+    double? HostMemPercent = null,
+    double? ProcCpuPercent = null,
+    double? ProcWorkingSetMB = null
+);
+
+public static class ServiceSurvey
+{
+    public static async Task QueryAsync(
+        string[] hosts,
+        string serviceName,
+        TimeSpan perHostTimeout,
+        int maxDegreeOfParallelism,
+        int retries,
+        CancellationToken ct,
+        Action<int, HostResult> onCompleted)
+    {
+        var indexed = hosts.Select((h, i) => (Host: h, Index: i)).ToArray();
+
+        await Parallel.ForEachAsync(indexed, new ParallelOptions
+        {
+            MaxDegreeOfParallelism = maxDegreeOfParallelism,
+            CancellationToken = ct
+        },
+        async (item, token) =>
+        {
+            var r = await QueryWithRetry(item.Host, serviceName, perHostTimeout, retries, token).ConfigureAwait(false);
+            onCompleted(item.Index, r);
+        });
+    }
+
+    private static async Task<HostResult> QueryWithRetry(string host, string serviceName, TimeSpan timeout, int retries, CancellationToken ct)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            var r = await QueryOneWithTimeout(host, serviceName, timeout, ct).ConfigureAwait(false);
+
+            if (r.Status is not ("Timeout" or "Error" or "AuthError") || attempt >= retries)
+                return r;
+
+            try { await Task.Delay(TimeSpan.FromMilliseconds(250 * Math.Pow(2, attempt)), ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return r; }
+        }
+    }
+
+    private static async Task<HostResult> QueryOneWithTimeout(string host, string serviceName, TimeSpan timeout, CancellationToken outerCt)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(outerCt);
+        cts.CancelAfter(timeout);
+
+        try
+        {
+            return await Task.Run(() =>
+            {
+                var scope = new ManagementScope($@"\\{host}\root\cimv2");
+                scope.Connect();
+
+                string esc = serviceName.Replace("'", "''");
+                var query = new ObjectQuery($"SELECT Name,State,Status,StartMode,ExitCode,ProcessId FROM Win32_Service WHERE Name='{esc}'");
+                using var searcher = new ManagementObjectSearcher(scope, query)
+                {
+                    Options = new EnumerationOptions { Timeout = timeout, Rewindable = false, ReturnImmediately = true }
+                };
+
+                using var col = searcher.Get();
+                var svc = col.Cast<ManagementObject>().FirstOrDefault();
+                if (svc is null)
+                    return new HostResult(host, "NotFound", "service missing");
+
+                string state     = (string) (svc["State"]     ?? "Unknown");
+                string status    = (string) (svc["Status"]    ?? "Unknown");
+                string startMode = (string) (svc["StartMode"] ?? "Unknown");
+                int exitCode     = Convert.ToInt32(svc["ExitCode"] ?? 0);
+                uint pid         = Convert.ToUInt32(svc["ProcessId"] ?? 0);
+
+                // ホスト全体CPU/メモリ
+                double? hostCpu = TryGetHostCpuPercent(scope, timeout);
+                double? hostMem = TryGetHostMemPercent(scope, timeout);
+
+                // プロセスCPU/WS（PIDがある場合）
+                double? procCpu = null;
+                double? procWsMB = null;
+                if (pid > 0)
+                {
+                    (procCpu, procWsMB) = TryGetProcCpuAndWs(scope, pid, timeout);
+                }
+
+                string combined = $"{state}|{status}|StartMode={startMode}|ExitCode={exitCode}"
+                                  + (hostCpu is not null ? $"|HostCpu={hostCpu:0.0}%" : "")
+                                  + (hostMem is not null ? $"|HostMem={hostMem:0.0}%" : "")
+                                  + (procCpu is not null ? $"|ProcCpu={procCpu:0.0}%" : "")
+                                  + (procWsMB is not null ? $"|ProcWS={procWsMB:0.0}MB" : "");
+
+                return new HostResult(host, MapState(state), combined, hostCpu, hostMem, procCpu, procWsMB);
+
+            }, cts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return new HostResult(host, "Timeout", "no response within limit");
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return new HostResult(host, "AuthError", "access denied");
+        }
+        catch (Exception ex)
+        {
+            return new HostResult(host, "Error", ex.GetType().Name);
+        }
+    }
+
+    private static string MapState(string state) => state switch
+    {
+        "Running" => "Running",
+        "Stopped" or "Paused" => "Down",
+        "Start Pending" or "Stop Pending" or "Pause Pending" or "Continue Pending" => "Pending",
+        _ => "Unknown"
+    };
+
+    // CPU（ホスト全体）
+    private static double? TryGetHostCpuPercent(ManagementScope scope, TimeSpan timeout)
+    {
+        try
+        {
+            var q = new ObjectQuery("SELECT PercentProcessorTime FROM Win32_PerfFormattedData_PerfOS_Processor WHERE Name='_Total'");
+            using var s = new ManagementObjectSearcher(scope, q)
+            { Options = new EnumerationOptions { Timeout = timeout, ReturnImmediately = true, Rewindable = false } };
+            using var col = s.Get();
+            var mo = col.Cast<ManagementObject>().FirstOrDefault();
+            return mo is null ? null : Convert.ToDouble(mo["PercentProcessorTime"]);
+        }
+        catch { return null; }
+    }
+
+    // メモリ（ホスト全体）
+    private static double? TryGetHostMemPercent(ManagementScope scope, TimeSpan timeout)
+    {
+        try
+        {
+            var q = new ObjectQuery("SELECT TotalVisibleMemorySize,FreePhysicalMemory FROM Win32_OperatingSystem");
+            using var s = new ManagementObjectSearcher(scope, q)
+            { Options = new EnumerationOptions { Timeout = timeout, ReturnImmediately = true, Rewindable = false } };
+            using var col = s.Get();
+            var mo = col.Cast<ManagementObject>().FirstOrDefault();
+            if (mo is null) return null;
+            double totalKB = Convert.ToDouble(mo["TotalVisibleMemorySize"]);
+            double freeKB  = Convert.ToDouble(mo["FreePhysicalMemory"]);
+            if (totalKB <= 0) return null;
+            double usedPercent = (1.0 - (freeKB / totalKB)) * 100.0;
+            return usedPercent;
+        }
+        catch { return null; }
+    }
+
+    // プロセス CPU% と WorkingSet(MB)
+    private static (double? cpu, double? wsMB) TryGetProcCpuAndWs(ManagementScope scope, uint pid, TimeSpan timeout)
+    {
+        try
+        {
+            // CPU%（PerfProc）
+            double? cpu = null;
+            var q1 = new ObjectQuery($"SELECT IDProcess,PercentProcessorTime,WorkingSet FROM Win32_PerfFormattedData_PerfProc_Process WHERE IDProcess={pid}");
+            using var s1 = new ManagementObjectSearcher(scope, q1)
+            { Options = new EnumerationOptions { Timeout = timeout, ReturnImmediately = true, Rewindable = false } };
+            using var col1 = s1.Get();
+            var mo1 = col1.Cast<ManagementObject>().FirstOrDefault();
+            if (mo1 is not null)
+            {
+                if (mo1["PercentProcessorTime"] != null)
+                    cpu = Convert.ToDouble(mo1["PercentProcessorTime"]);
+            }
+
+            // WorkingSet は PerfProc からも取れるが、確実にするため Win32_Process で補強
+            double? wsMB = null;
+            var q2 = new ObjectQuery($"SELECT WorkingSetSize FROM Win32_Process WHERE ProcessId={pid}");
+            using var s2 = new ManagementObjectSearcher(scope, q2)
+            { Options = new EnumerationOptions { Timeout = timeout, ReturnImmediately = true, Rewindable = false } };
+            using var col2 = s2.Get();
+            var mo2 = col2.Cast<ManagementObject>().FirstOrDefault();
+            if (mo2 is not null && mo2["WorkingSetSize"] != null)
+            {
+                double bytes = Convert.ToDouble(mo2["WorkingSetSize"]);
+                wsMB = bytes / (1024.0 * 1024.0);
+            }
+
+            return (cpu, wsMB);
+        }
+        catch { return (null, null); }
+    }
+}
+
+// CSV（入力順のまま）
+public static class CsvWriter
+{
+    public static async Task WriteAsync(string path, IEnumerable<HostResult> results)
+    {
+        var dir = Path.GetDirectoryName(Path.GetFullPath(path));
+        if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+
+        await using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read);
+        await using var sw = new StreamWriter(fs, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+
+        await sw.WriteLineAsync("Host,Status,Detail,HostCpu,HostMem,ProcCpu,ProcWS_MB");
+        foreach (var r in results)
+        {
+            string Esc(string s) => (s.Contains(',') || s.Contains('"')) ? $"\"{s.Replace("\"", "\"\"")}\"" : s;
+            string f(double? v)  => v is null ? "" : v.Value.ToString("0.0", CultureInfo.InvariantCulture);
+
+            await sw.WriteLineAsync($"{Esc(r.Host)},{Esc(r.Status)},{Esc(r.Detail)},{f(r.HostCpuPercent)},{f(r.HostMemPercent)},{f(r.ProcCpuPercent)},{f(r.ProcWorkingSetMB)}");
+        }
+    }
+}
+```
+
+---
+
+## 補足とコツ
+
+* **入力順プログレス**は `OrderedProgressPrinter` がカギ。
+  並列に終わった結果を配列に入れ、**次の未出力インデックスから連続で出力**します。
+* WMIは**資格情報とFW**が必要です（リモート）。ドメイン環境なら監視用アカウントに権限付与を。
+* CPU%は**瞬間値**（フォーマット済み）です。時間平均が必要なら複数回サンプリングを追加してね。
+* さらに速くしたい時は **`degree` を上げる / `timeout` を短くする** の2軸で調整。
+
+必要なら、**HTMLのきれいな表** or **Slack/メール通知**もすぐ付けます。どう出力したい？
+
+いいね、要件わかった。
+**「1回のサーバーループ」で、そのサーバーに存在する *複数* サービスをまとめて監視**できるように直します。
+入力順（hosts.txtの順）で**ホスト見出し → そのホストで監視するサービスを順に出力**します。
+
+# できること（今回の版）
+
+* `hosts.txt` … 監視対象サーバー（順序保持）
+* 監視対象サービスは2通りで指定
+
+  1. `services.txt` … 全ホストで共通のサービス群
+  2. `map.csv` … `Host,Service` の行で **ホストごとに異なる**サービスを指定（こちらを指定したら services.txt は無視）
+* **1ホスト1接続**（WMI）で、`Win32_Service` を **IN句一括取得**
+  → そのホストに無いサービスは `NotFound` で判定
+* **入力順のプログレス**（ホスト単位で出力）。各ホストの中は指定順でサービスを列挙
+* **CPU/メモリ（ホスト）** と **各サービスの ProcCPU/WorkingSet(MB)** を付加（WMI）
+* **並列数・タイムアウト・リトライ**調整可。`Timeout` は問題扱いで先へ進む
+
+---
+
+# 使い方
+
+```bash
+# 1) 全ホスト共通のサービス群
+dotnet run -- \
+  --hosts hosts.txt \
+  --services services.txt \
+  --degree 96 --timeout 3s --retries 1 --csv out.csv
+
+# 2) ホスト別に異なるサービス群（推奨）
+dotnet run -- \
+  --hosts hosts.txt \
+  --map map.csv \
+  --degree 96 --timeout 3s --retries 1 --csv out.csv
+```
+
+* `map.csv` 例：
+
+  ```
+  Host,Service
+  web01,AService
+  web02,AService
+  db01,AService
+  db01,BService
+  db02,BService
+  ```
+
+  → hosts.txt の順で `db01` にだけ `BService` を含めて監視、などが可能。
+
+---
+
+# Program.cs（そのまま貼ってOK / .NET 6+ / NuGet: System.Management, System.CommandLine）
+
+> 主要ポイント：
+>
+> * 入力から **ホスト→サービスの順序付きマップ** を作成
+> * **1ホスト1接続**で `Win32_Service WHERE Name IN (...)` を一括取得
+> * 取得PIDを集めて **Procカウンタも IN句で一括**（回数削減）
+> * **Ordered printer** でホスト順に見出し＋各サービス行を出力
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Collections.Concurrent;
+using System.CommandLine;
+using System.CommandLine.Invocation;
+using System.Globalization;
+using System.Linq;
+using System.Management; // NuGet: System.Management
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.IO;
+
+public class Program
+{
+    public static async Task<int> Main(string[] args)
+    {
+        var hostsOpt    = new Option<string>("--hosts", () => "hosts.txt", "ホスト一覧(1行1ホスト)");
+        var servicesOpt = new Option<string?>("--services", description: "共通サービス一覧(1行1サービス)");
+        var mapOpt      = new Option<string?>("--map", description: "ホスト別サービスのCSV (Host,Service)。指定時は --services を無視");
+        var degOpt      = new Option<int>("--degree", () => 96, "最大並列数");
+        var timeoutOpt  = new Option<string>("--timeout", () => "3s", "タイムアウト(例: 3s, 1500ms)");
+        var retriesOpt  = new Option<int>("--retries", () => 1, "失敗リトライ回数");
+        var csvOpt      = new Option<string?>("--csv", description: "CSV出力先");
+
+        var root = new RootCommand("複数サービス×複数サーバーを1ホスト1接続で並列監視（入力順プログレス付き）");
+        root.AddOptions(new[] { hostsOpt, servicesOpt, mapOpt, degOpt, timeoutOpt, retriesOpt, csvOpt });
+
+        root.SetHandler(async (InvocationContext ctx) =>
+        {
+            var hostsPath   = ctx.ParseResult.GetValueForOption(hostsOpt)!;
+            var servicesPath= ctx.ParseResult.GetValueForOption(servicesOpt);
+            var mapPath     = ctx.ParseResult.GetValueForOption(mapOpt);
+            var degree      = ctx.ParseResult.GetValueForOption(degOpt);
+            var timeoutS    = ctx.ParseResult.GetValueForOption(timeoutOpt)!;
+            var retries     = Math.Max(0, ctx.ParseResult.GetValueForOption(retriesOpt));
+            var csvPath     = ctx.ParseResult.GetValueForOption(csvOpt);
+
+            if (!File.Exists(hostsPath)) { Console.Error.WriteLine($"hostsが見つかりません: {hostsPath}"); ctx.ExitCode = 2; return; }
+            var hosts = ReadLines(hostsPath).ToArray();
+            if (hosts.Length == 0) { Console.Error.WriteLine("hostsが空です"); ctx.ExitCode = 2; return; }
+
+            var map = mapPath != null
+                ? BuildMapFromCsv(mapPath, hosts)
+                : BuildMapFromServices(hosts, servicesPath);
+
+            if (map.All(kv => kv.Value.Count == 0))
+            {
+                Console.Error.WriteLine("監視対象サービスがありません。（services/map の指定を確認）");
+                ctx.ExitCode = 2; return;
+            }
+
+            var timeout = ParseDuration(timeoutS);
+            Console.WriteLine($"Hosts: {hosts.Length}, Degree={degree}, Timeout={timeout}, Retries={retries}");
+            Console.WriteLine(mapPath != null ? $"Mapping: {mapPath}" : $"Services(all): {servicesPath}");
+            Console.WriteLine("-------------------------------------------------------------------------------");
+
+            using var cts = new CancellationTokenSource();
+            Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+            var results = new HostServiceResult[hosts.Length][]; // 各ホストごとに行配列
+            var printer = new OrderedHostPrinter(hosts, map);
+
+            await HostSurvey.QueryAsync(
+                hosts: hosts,
+                hostToServices: map,
+                perHostTimeout: timeout,
+                maxDegreeOfParallelism: degree,
+                retries: retries,
+                ct: cts.Token,
+                onCompleted: (hostIndex, rows) =>
+                {
+                    results[hostIndex] = rows;
+                    printer.TryPrintHost(results);
+                });
+
+            printer.Flush(results);
+
+            // SUMMARY
+            Console.WriteLine("\n=== SUMMARY ===");
+            var flat = results.Where(r => r != null).SelectMany(r => r!).ToArray();
+            foreach (var g in flat.GroupBy(r => r.Status).OrderByDescending(g => g.Count()))
+                Console.WriteLine($"{g.Key,-10}: {g.Count()}");
+
+            if (!string.IsNullOrEmpty(csvPath))
+            {
+                await CsvWriter.WriteAsync(csvPath!, hosts, results, map);
+                Console.WriteLine($"\nCSV: {csvPath}");
+            }
+
+            ctx.ExitCode = 0;
+        });
+
+        return await root.InvokeAsync(args);
+    }
+
+    static IEnumerable<string> ReadLines(string path)
+        => File.ReadAllLines(path)
+               .Select(l => l.Trim())
+               .Where(l => !string.IsNullOrWhiteSpace(l) && !l.StartsWith("#"))
+               .Distinct(StringComparer.OrdinalIgnoreCase);
+
+    static Dictionary<string, List<string>> BuildMapFromServices(string[] hosts, string? servicesPath)
+    {
+        if (string.IsNullOrEmpty(servicesPath) || !File.Exists(servicesPath))
+            return hosts.ToDictionary(h => h, _ => new List<string>(), StringComparer.OrdinalIgnoreCase);
+
+        var services = ReadLines(servicesPath).ToList();
+        return hosts.ToDictionary(h => h, _ => new List<string>(services), StringComparer.OrdinalIgnoreCase);
+    }
+
+    static Dictionary<string, List<string>> BuildMapFromCsv(string mapPath, string[] hosts)
+    {
+        var hostSet = new HashSet<string>(hosts, StringComparer.OrdinalIgnoreCase);
+        var map = hosts.ToDictionary(h => h, _ => new List<string>(), StringComparer.OrdinalIgnoreCase);
+
+        foreach (var line in ReadLines(mapPath))
+        {
+            var parts = line.Split(',', StringSplitOptions.TrimEntries);
+            if (parts.Length < 2) continue;
+            var host = parts[0];
+            var svc  = parts[1];
+            if (!hostSet.Contains(host)) continue; // hosts.txtに無いものは無視
+            map[host].Add(svc);
+        }
+        return map;
+    }
+
+    static TimeSpan ParseDuration(string s)
+    {
+        s = s.Trim().ToLowerInvariant();
+        if (s.EndsWith("ms") && int.TryParse(s[..^2], out var ms)) return TimeSpan.FromMilliseconds(ms);
+        if (s.EndsWith("s")  && double.TryParse(s[..^1], NumberStyles.Any, CultureInfo.InvariantCulture, out var sec)) return TimeSpan.FromSeconds(sec);
+        if (double.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out var fallbackSec)) return TimeSpan.FromSeconds(fallbackSec);
+        throw new ArgumentException($"タイムアウト形式が不正です: {s}");
+    }
+}
+
+// 出力（入力順でホスト見出し→サービス詳細）
+public sealed class OrderedHostPrinter
+{
+    private readonly string[] _hosts;
+    private readonly Dictionary<string, List<string>> _map;
+    private int _nextHostIndex = 0;
+    private readonly object _gate = new();
+
+    public OrderedHostPrinter(string[] hosts, Dictionary<string, List<string>> map) { _hosts = hosts; _map = map; }
+
+    public void TryPrintHost(HostServiceResult[][] results)
+    {
+        lock (_gate)
+        {
+            while (_nextHostIndex < results.Length && results[_nextHostIndex] is not null)
+            {
+                var host = _hosts[_nextHostIndex];
+                var rows = results[_nextHostIndex]!;
+                Console.WriteLine($"\n[{_nextHostIndex+1,4}/{_hosts.Length}] {host}  (services: {rows.Length})");
+
+                foreach (var r in rows)
+                {
+                    Console.WriteLine($"  - {r.Service,-20} {r.Status,-8}  {r.Detail}");
+                }
+                _nextHostIndex++;
+            }
+        }
+    }
+
+    public void Flush(HostServiceResult[][] results) => TryPrintHost(results);
+}
+
+// 1行：ホスト×サービスの結果
+public record HostServiceResult(
+    string Host,
+    string Service,
+    string Status,     // Running / Down / Pending / Timeout / Error / AuthError / NotFound / Unknown
+    string Detail,     // State|Status|StartMode|ExitCode|HostCpu=..|HostMem=..|ProcCpu=..|ProcWS=..
+    double? HostCpuPercent = null,
+    double? HostMemPercent = null,
+    double? ProcCpuPercent = null,
+    double? ProcWorkingSetMB = null
+);
+
+public static class HostSurvey
+{
+    public static async Task QueryAsync(
+        string[] hosts,
+        Dictionary<string, List<string>> hostToServices,
+        TimeSpan perHostTimeout,
+        int maxDegreeOfParallelism,
+        int retries,
+        CancellationToken ct,
+        Action<int, HostServiceResult[]> onCompleted)
+    {
+        var indexed = hosts.Select((h, i) => (Host: h, Index: i)).ToArray();
+
+        await Parallel.ForEachAsync(indexed, new ParallelOptions
+        {
+            MaxDegreeOfParallelism = maxDegreeOfParallelism,
+            CancellationToken = ct
+        },
+        async (item, token) =>
+        {
+            var services = hostToServices[item.Host];
+            var rows = await QueryHostWithRetry(item.Host, services, perHostTimeout, retries, token).ConfigureAwait(false);
+            onCompleted(item.Index, rows);
+        });
+    }
+
+    private static async Task<HostServiceResult[]> QueryHostWithRetry(string host, List<string> services, TimeSpan timeout, int retries, CancellationToken ct)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            var r = await QueryHostOnce(host, services, timeout, ct).ConfigureAwait(false);
+            // ホストレベルで Timeout/Error/AuthError のみ再試行、それ以外は即返す
+            bool needRetry = r.All(x => x.Status is "Timeout" or "Error" or "AuthError");
+            if (!needRetry || attempt >= retries) return r;
+
+            try { await Task.Delay(TimeSpan.FromMilliseconds(250 * Math.Pow(2, attempt)), ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return r; }
+        }
+    }
+
+    private static async Task<HostServiceResult[]> QueryHostOnce(string host, List<string> services, TimeSpan timeout, CancellationToken outerCt)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(outerCt);
+        cts.CancelAfter(timeout);
+
+        try
+        {
+            return await Task.Run(() =>
+            {
+                var scope = new ManagementScope($@"\\{host}\root\cimv2");
+                scope.Connect();
+
+                // 監視するサービスが無いホストは空で返す
+                if (services.Count == 0)
+                    return Array.Empty<HostServiceResult>();
+
+                // Win32_Service を IN句で一括取得
+                var inNames = string.Join(",", services.Select(s => $"'{s.Replace("'", "''")}'"));
+                var qSvc = new ObjectQuery($"SELECT Name,State,Status,StartMode,ExitCode,ProcessId FROM Win32_Service WHERE Name IN ({inNames})");
+                using var sSvc = new ManagementObjectSearcher(scope, qSvc)
+                { Options = new EnumerationOptions { Timeout = timeout, ReturnImmediately = true, Rewindable = false } };
+                using var svcCol = sSvc.Get();
+
+                var svcDict = svcCol.Cast<ManagementObject>().ToDictionary(
+                    mo => (string)mo["Name"],
+                    mo => mo,
+                    StringComparer.OrdinalIgnoreCase);
+
+                // ホストCPU/メモリ（1回）
+                double? hostCpu = TryGetHostCpuPercent(scope, timeout);
+                double? hostMem = TryGetHostMemPercent(scope, timeout);
+
+                // PID収集 → Procカウンタを IN句で一括
+                var pidList = services
+                    .Select(s => svcDict.TryGetValue(s, out var mo) ? Convert.ToUInt32(mo["ProcessId"] ?? 0) : 0u)
+                    .Where(pid => pid > 0)
+                    .Distinct()
+                    .ToArray();
+
+                var procCpuDict = TryGetProcsCpu(scope, pidList, timeout);
+                var procWsDict  = TryGetProcsWS (scope, pidList, timeout);
+
+                // 入力のサービス順に並べる
+                var rows = new List<HostServiceResult>(services.Count);
+                foreach (var svc in services)
+                {
+                    if (!svcDict.TryGetValue(svc, out var mo))
+                    {
+                        rows.Add(new HostServiceResult(host, svc, "NotFound", "service missing", hostCpu, hostMem));
+                        continue;
+                    }
+
+                    string state     = (string)(mo["State"]     ?? "Unknown");
+                    string status    = (string)(mo["Status"]    ?? "Unknown");
+                    string startMode = (string)(mo["StartMode"] ?? "Unknown");
+                    int exitCode     = Convert.ToInt32(mo["ExitCode"] ?? 0);
+                    uint pid         = Convert.ToUInt32(mo["ProcessId"] ?? 0);
+
+                    double? pCpu  = (pid > 0 && procCpuDict.TryGetValue(pid, out var c)) ? c : null;
+                    double? pWsMB = (pid > 0 && procWsDict .TryGetValue(pid, out var w)) ? w : null;
+
+                    string detail = $"{state}|{status}|StartMode={startMode}|ExitCode={exitCode}"
+                                    + (hostCpu is not null ? $"|HostCpu={hostCpu:0.0}%" : "")
+                                    + (hostMem is not null ? $"|HostMem={hostMem:0.0}%" : "")
+                                    + (pCpu   is not null ? $"|ProcCpu={pCpu:0.0}%"   : "")
+                                    + (pWsMB  is not null ? $"|ProcWS={pWsMB:0.0}MB"  : "");
+
+                    rows.Add(new HostServiceResult(
+                        host, svc, MapState(state), detail, hostCpu, hostMem, pCpu, pWsMB));
+                }
+
+                return rows.ToArray();
+
+            }, cts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // ホスト丸ごとタイムアウト → そのホストに割り当てたサービス分、Timeout行で埋める
+            return services.Select(s => new HostServiceResult(host, s, "Timeout", "no response within limit")).ToArray();
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return services.Select(s => new HostServiceResult(host, s, "AuthError", "access denied")).ToArray();
+        }
+        catch (Exception ex)
+        {
+            return services.Select(s => new HostServiceResult(host, s, "Error", ex.GetType().Name)).ToArray();
+        }
+    }
+
+    private static string MapState(string state) => state switch
+    {
+        "Running" => "Running",
+        "Stopped" or "Paused" => "Down",
+        "Start Pending" or "Stop Pending" or "Pause Pending" or "Continue Pending" => "Pending",
+        _ => "Unknown"
+    };
+
+    // Host CPU
+    private static double? TryGetHostCpuPercent(ManagementScope scope, TimeSpan timeout)
+    {
+        try
+        {
+            var q = new ObjectQuery("SELECT PercentProcessorTime FROM Win32_PerfFormattedData_PerfOS_Processor WHERE Name='_Total'");
+            using var s = new ManagementObjectSearcher(scope, q) { Options = new EnumerationOptions { Timeout = timeout, ReturnImmediately = true, Rewindable = false } };
+            using var col = s.Get();
+            var mo = col.Cast<ManagementObject>().FirstOrDefault();
+            return mo is null ? null : Convert.ToDouble(mo["PercentProcessorTime"]);
+        }
+        catch { return null; }
+    }
+
+    // Host Mem
+    private static double? TryGetHostMemPercent(ManagementScope scope, TimeSpan timeout)
+    {
+        try
+        {
+            var q = new ObjectQuery("SELECT TotalVisibleMemorySize,FreePhysicalMemory FROM Win32_OperatingSystem");
+            using var s = new ManagementObjectSearcher(scope, q) { Options = new EnumerationOptions { Timeout = timeout, ReturnImmediately = true, Rewindable = false } };
+            using var col = s.Get();
+            var mo = col.Cast<ManagementObject>().FirstOrDefault();
+            if (mo is null) return null;
+            double totalKB = Convert.ToDouble(mo["TotalVisibleMemorySize"]);
+            double freeKB  = Convert.ToDouble(mo["FreePhysicalMemory"]);
+            if (totalKB <= 0) return null;
+            return (1.0 - (freeKB / totalKB)) * 100.0;
+        }
+        catch { return null; }
+    }
+
+    // Proc CPU%（複数PIDをIN句で）
+    private static Dictionary<uint, double> TryGetProcsCpu(ManagementScope scope, uint[] pids, TimeSpan timeout)
+    {
+        var dict = new Dictionary<uint, double>();
+        if (pids.Length == 0) return dict;
+        try
+        {
+            var inPids = string.Join(",", pids);
+            var q = new ObjectQuery($"SELECT IDProcess,PercentProcessorTime FROM Win32_PerfFormattedData_PerfProc_Process WHERE IDProcess IN ({inPids})");
+            using var s = new ManagementObjectSearcher(scope, q) { Options = new EnumerationOptions { Timeout = timeout, ReturnImmediately = true, Rewindable = false } };
+            using var col = s.Get();
+            foreach (ManagementObject mo in col)
+            {
+                uint id = Convert.ToUInt32(mo["IDProcess"]);
+                if (mo["PercentProcessorTime"] != null)
+                    dict[id] = Convert.ToDouble(mo["PercentProcessorTime"]);
+            }
+        }
+        catch { }
+        return dict;
+    }
+
+    // Proc WS（MB）
+    private static Dictionary<uint, double> TryGetProcsWS(ManagementScope scope, uint[] pids, TimeSpan timeout)
+    {
+        var dict = new Dictionary<uint, double>();
+        if (pids.Length == 0) return dict;
+        try
+        {
+            var inPids = string.Join(",", pids);
+            var q = new ObjectQuery($"SELECT ProcessId,WorkingSetSize FROM Win32_Process WHERE ProcessId IN ({inPids})");
+            using var s = new ManagementObjectSearcher(scope, q) { Options = new EnumerationOptions { Timeout = timeout, ReturnImmediately = true, Rewindable = false } };
+            using var col = s.Get();
+            foreach (ManagementObject mo in col)
+            {
+                uint id = Convert.ToUInt32(mo["ProcessId"]);
+                if (mo["WorkingSetSize"] != null)
+                {
+                    double bytes = Convert.ToDouble(mo["WorkingSetSize"]);
+                    dict[id] = bytes / (1024.0 * 1024.0);
+                }
+            }
+        }
+        catch { }
+        return dict;
+    }
+}
+
+// CSV：ホスト順・サービス順で出力
+public static class CsvWriter
+{
+    public static async Task WriteAsync(string path, string[] hosts, HostServiceResult[][] rows, Dictionary<string, List<string>> map)
+    {
+        var dir = Path.GetDirectoryName(Path.GetFullPath(path));
+        if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+
+        await using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read);
+        await using var sw = new StreamWriter(fs, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+
+        await sw.WriteLineAsync("Host,Service,Status,Detail,HostCpu,HostMem,ProcCpu,ProcWS_MB");
+
+        for (int i = 0; i < hosts.Length; i++)
+        {
+            var host = hosts[i];
+            var list = rows[i] ?? Array.Empty<HostServiceResult>();
+            foreach (var r in list)
+            {
+                string Esc(string s) => (s.Contains(',') || s.Contains('"')) ? $"\"{s.Replace("\"", "\"\"")}\"" : s;
+                string F(double? v)  => v is null ? "" : v.Value.ToString("0.0", CultureInfo.InvariantCulture);
+                await sw.WriteLineAsync($"{Esc(r.Host)},{Esc(r.Service)},{Esc(r.Status)},{Esc(r.Detail)},{F(r.HostCpuPercent)},{F(r.HostMemPercent)},{F(r.ProcCpuPercent)},{F(r.ProcWorkingSetMB)}");
+            }
+        }
+    }
+}
+```
+
+---
+
+## 使い方メモ
+
+* **まずは `--map` を推奨**：ホストごとにサービスが違う要件にフィットします
+* **タイムアウト**は 2–5 秒、**並列数**は 64–256 あたりでチューニング
+* WMIリモートは **資格情報とFW（WMI/RPC）** を要確認
+* 出力は **ホスト見出し → サービス行** を**入力順**で流れます（プログレスとして読める）
+
+必要ならこの出力を **HTMLダッシュボード** や **Slack通知** に変換するミニ追加コードも用意します。
+

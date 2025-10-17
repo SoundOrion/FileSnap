@@ -1,0 +1,1259 @@
+いいですよ！主にここを直しました👇
+
+* `IOControl(KeepAliveValues)` への入力を **ゼロアロケーション**で書けるように
+  `BinaryPrimitives.WriteInt32LittleEndian` を使用（`BitConverter.GetBytes(...).CopyTo(...)` を排除）
+* ついでに小さな堅牢化（再接続時の古いソケット破棄、`ConfigureAwait(false)` の徹底 など）
+
+---
+
+# サーバー（修正版）
+
+```csharp
+using System;
+using System.Buffers.Binary; // ← 追加
+using System.Collections.Concurrent;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+public sealed class HeartbeatTcpServer : IAsyncDisposable
+{
+    private readonly TcpListener _listener;
+    private readonly ConcurrentDictionary<EndPoint, ClientSession> _clients = new();
+    private readonly TimeSpan _heartbeatInterval;
+    private readonly TimeSpan _heartbeatTimeout;
+    private CancellationTokenSource? _cts;
+    private Task? _acceptTask;
+
+    public HeartbeatTcpServer(
+        int port,
+        TimeSpan? heartbeatInterval = null,
+        TimeSpan? heartbeatTimeout = null)
+    {
+        _listener = new TcpListener(IPAddress.Any, port);
+        _heartbeatInterval = heartbeatInterval ?? TimeSpan.FromSeconds(10);
+        _heartbeatTimeout = heartbeatTimeout ?? TimeSpan.FromSeconds(30);
+    }
+
+    public async Task StartAsync(CancellationToken cancellationToken = default)
+    {
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _listener.Start();
+        Console.WriteLine("Server started.");
+        _acceptTask = AcceptLoopAsync(_cts.Token);
+        await Task.CompletedTask;
+    }
+
+    public async Task StopAsync()
+    {
+        if (_cts is null) return;
+        _cts.Cancel();
+        _listener.Stop();
+
+        foreach (var (_, s) in _clients)
+        {
+            try { await s.DisposeAsync(); } catch { /* ignore */ }
+        }
+        if (_acceptTask is not null)
+        {
+            try { await _acceptTask.ConfigureAwait(false); } catch { /* ignore */ }
+        }
+    }
+
+    public async ValueTask DisposeAsync() => await StopAsync();
+
+    private async Task AcceptLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                var client = await _listener.AcceptTcpClientAsync(ct).ConfigureAwait(false);
+                client.NoDelay = true;
+
+                // 任意：OSのTCP KeepAlive（早期検出・NAT越えの安定化）
+                TryEnableKeepAlive(client, keepAliveTimeMs: 30_000, keepAliveIntervalMs: 5_000);
+
+                var session = new ClientSession(client, _heartbeatInterval, _heartbeatTimeout, RemoveClient, ct);
+                _clients[client.Client.RemoteEndPoint!] = session;
+                Console.WriteLine($"Client connected: {client.Client.RemoteEndPoint}");
+                _ = session.RunAsync(); // fire-and-forget
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (ObjectDisposedException) { }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[AcceptLoop] {ex}");
+        }
+    }
+
+    private void RemoveClient(EndPoint ep)
+    {
+        _clients.TryRemove(ep, out _);
+        Console.WriteLine($"Client removed: {ep}");
+    }
+
+    private static void TryEnableKeepAlive(TcpClient client, uint keepAliveTimeMs, uint keepAliveIntervalMs)
+    {
+        try
+        {
+            var s = client.Client;
+            s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+
+            // Windows の詳細設定（12バイト固定: [on(4)][time(4)][interval(4)] little-endian）
+            byte[] inOption = new byte[12];
+            BinaryPrimitives.WriteInt32LittleEndian(inOption.AsSpan(0, 4), 1); // 有効化
+            BinaryPrimitives.WriteInt32LittleEndian(inOption.AsSpan(4, 4), unchecked((int)keepAliveTimeMs));
+            BinaryPrimitives.WriteInt32LittleEndian(inOption.AsSpan(8, 4), unchecked((int)keepAliveIntervalMs));
+
+            s.IOControl(IOControlCode.KeepAliveValues, inOption, null);
+        }
+        catch
+        {
+            // 未対応OSは黙ってスキップ
+        }
+    }
+
+    private sealed class ClientSession : IAsyncDisposable
+    {
+        private readonly TcpClient _client;
+        private readonly NetworkStream _ns;
+        private readonly StreamReader _reader;
+        private readonly StreamWriter _writer;
+        private readonly TimeSpan _interval;
+        private readonly TimeSpan _timeout;
+        private readonly Action<EndPoint> _onClose;
+        private readonly CancellationToken _serverCt;
+
+        private DateTime _lastSeenUtc;
+        private readonly EndPoint _ep;
+
+        public ClientSession(
+            TcpClient client,
+            TimeSpan interval,
+            TimeSpan timeout,
+            Action<EndPoint> onClose,
+            CancellationToken serverCt)
+        {
+            _client = client;
+            _ns = client.GetStream();
+            _reader = new StreamReader(_ns, new UTF8Encoding(false), detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true);
+            _writer = new StreamWriter(_ns, new UTF8Encoding(false)) { AutoFlush = true };
+            _interval = interval;
+            _timeout = timeout;
+            _onClose = onClose;
+            _serverCt = serverCt;
+            _lastSeenUtc = DateTime.UtcNow;
+            _ep = _client.Client.RemoteEndPoint!;
+        }
+
+        public async Task RunAsync()
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(_serverCt);
+            var ct = cts.Token;
+
+            var recv = ReceiveLoopAsync(ct);
+            var hb = HeartbeatLoopAsync(ct);
+
+            try
+            {
+                await Task.WhenAny(recv, hb).ConfigureAwait(false);
+            }
+            finally
+            {
+                cts.Cancel();
+                try { await Task.WhenAll(Suppress(recv), Suppress(hb)).ConfigureAwait(false); } catch { }
+                await DisposeAsync();
+                _onClose(_ep);
+            }
+        }
+
+        private async Task ReceiveLoopAsync(CancellationToken ct)
+        {
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    // .NET 6+ : ReadLineAsync を WaitAsync でキャンセル可能に
+                    var line = await _reader.ReadLineAsync().WaitAsync(ct).ConfigureAwait(false);
+                    if (line is null) break; // FIN 受信など
+
+                    _lastSeenUtc = DateTime.UtcNow;
+
+                    if (line == "PING")
+                    {
+                        await _writer.WriteLineAsync("PONG").ConfigureAwait(false);
+                        continue;
+                    }
+
+                    if (line == "PONG")
+                    {
+                        // 心拍応答。特に処理不要
+                        continue;
+                    }
+
+                    // アプリメッセージ：ここで処理。例はエコー
+                    Console.WriteLine($"[{_ep}] {line}");
+                    await _writer.WriteLineAsync($"ECHO: {line}").ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (IOException) { } // 切断等
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Recv {_ep}] {ex.Message}");
+            }
+        }
+
+        private async Task HeartbeatLoopAsync(CancellationToken ct)
+        {
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    // 送信（サーバー主導）
+                    await _writer.WriteLineAsync("PING").ConfigureAwait(false);
+
+                    // タイムアウト判定
+                    var until = DateTime.UtcNow + _timeout;
+                    while (DateTime.UtcNow < until && !ct.IsCancellationRequested)
+                    {
+                        await Task.Delay(TimeSpan.FromMilliseconds(200), ct).ConfigureAwait(false);
+                        if (DateTime.UtcNow - _lastSeenUtc < _timeout)
+                            break;
+                    }
+
+                    if (DateTime.UtcNow - _lastSeenUtc >= _timeout)
+                    {
+                        Console.WriteLine($"[Heartbeat] timeout: {_ep}");
+                        break; // 切断
+                    }
+
+                    await Task.Delay(_interval, ct).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (IOException) { }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Heartbeat {_ep}] {ex.Message}");
+            }
+        }
+
+        private static async Task Suppress(Task t)
+        {
+            try { await t.ConfigureAwait(false); } catch { }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            try { _writer.Dispose(); } catch { }
+            try { _reader.Dispose(); } catch { }
+            try { _ns.Dispose(); } catch { }
+            try { _client.Close(); } catch { }
+            await Task.CompletedTask;
+        }
+    }
+}
+```
+
+## 実行用 Main（そのまま）
+
+```csharp
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+
+class Program
+{
+    static async Task Main()
+    {
+        using var cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+        var server = new HeartbeatTcpServer(
+            port: 5000,
+            heartbeatInterval: TimeSpan.FromSeconds(10),
+            heartbeatTimeout:  TimeSpan.FromSeconds(30));
+
+        await server.StartAsync(cts.Token);
+
+        Console.WriteLine("Server running. Ctrl+C to stop.");
+        try { await Task.Delay(Timeout.Infinite, cts.Token); }
+        catch (OperationCanceledException) { }
+
+        await server.StopAsync();
+        Console.WriteLine("Server stopped.");
+    }
+}
+```
+
+---
+
+# クライアント（修正版）
+
+```csharp
+using System;
+using System.Buffers.Binary; // ← 追加
+using System.IO;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+public sealed class HeartbeatTcpClient : IAsyncDisposable
+{
+    private readonly string _host;
+    private readonly int _port;
+    private TcpClient? _client;
+    private NetworkStream? _ns;
+    private StreamReader? _reader;
+    private StreamWriter? _writer;
+    private readonly CancellationTokenSource _cts = new();
+
+    public HeartbeatTcpClient(string host, int port)
+    {
+        _host = host;
+        _port = port;
+    }
+
+    public async Task ConnectAsync()
+    {
+        // 既存接続があればクリーンアップ（再接続時のため）
+        await CleanupAsync();
+
+        _client = new TcpClient();
+        await _client.ConnectAsync(_host, _port).ConfigureAwait(false);
+        _client.NoDelay = true;
+
+        // OS の TCP KeepAlive（任意）
+        TryEnableKeepAlive(_client, 30_000, 5_000);
+
+        _ns = _client.GetStream();
+        _reader = new StreamReader(_ns, new UTF8Encoding(false), detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true);
+        _writer = new StreamWriter(_ns, new UTF8Encoding(false)) { AutoFlush = true };
+
+        Console.WriteLine($"Connected to {_host}:{_port}");
+        _ = ReceiveLoopAsync(_cts.Token); // fire-and-forget
+    }
+
+    public async Task SendAsync(string line)
+    {
+        if (_writer is null) throw new InvalidOperationException("Not connected.");
+        await _writer.WriteLineAsync(line).ConfigureAwait(false);
+    }
+
+    private async Task ReceiveLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                var line = await _reader!.ReadLineAsync().WaitAsync(ct).ConfigureAwait(false);
+                if (line is null) break;
+
+                if (line == "PING")
+                {
+                    await _writer!.WriteLineAsync("PONG").ConfigureAwait(false);
+                    continue;
+                }
+
+                Console.WriteLine($"[Server] {line}");
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (IOException) { }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Client Receive] {ex.Message}");
+        }
+
+        await ReconnectLoopAsync().ConfigureAwait(false);
+    }
+
+    private async Task ReconnectLoopAsync()
+    {
+        int delayMs = 1000;
+        while (!_cts.IsCancellationRequested)
+        {
+            Console.WriteLine($"Reconnecting in {delayMs} ms...");
+            try { await Task.Delay(delayMs, _cts.Token).ConfigureAwait(false); } catch { return; }
+
+            try
+            {
+                await ConnectAsync().ConfigureAwait(false);
+                Console.WriteLine("Reconnected.");
+                return;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Reconnect failed: {ex.Message}");
+                delayMs = Math.Min(delayMs * 2, 15_000); // 簡易指数バックオフ
+            }
+        }
+    }
+
+    private static void TryEnableKeepAlive(TcpClient client, uint keepAliveTimeMs, uint keepAliveIntervalMs)
+    {
+        try
+        {
+            var s = client.Client;
+            s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+
+            byte[] inOption = new byte[12];
+            BinaryPrimitives.WriteInt32LittleEndian(inOption.AsSpan(0, 4), 1);
+            BinaryPrimitives.WriteInt32LittleEndian(inOption.AsSpan(4, 4), unchecked((int)keepAliveTimeMs));
+            BinaryPrimitives.WriteInt32LittleEndian(inOption.AsSpan(8, 4), unchecked((int)keepAliveIntervalMs));
+            s.IOControl(IOControlCode.KeepAliveValues, inOption, null);
+        }
+        catch { }
+    }
+
+    private async Task CleanupAsync()
+    {
+        try { _writer?.Dispose(); } catch { }
+        try { _reader?.Dispose(); } catch { }
+        try { _ns?.Dispose(); } catch { }
+        try { _client?.Close(); } catch { }
+        await Task.CompletedTask;
+        _writer = null; _reader = null; _ns = null; _client = null;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _cts.Cancel();
+        await CleanupAsync();
+    }
+}
+```
+
+## クライアント実行例（そのまま）
+
+```csharp
+using System;
+using System.Threading.Tasks;
+
+class Program
+{
+    static async Task Main()
+    {
+        await using var client = new HeartbeatTcpClient("127.0.0.1", 5000);
+        await client.ConnectAsync();
+
+        Console.WriteLine("Type messages to send. Ctrl+C to exit.");
+        while (true)
+        {
+            var line = Console.ReadLine();
+            if (string.IsNullOrEmpty(line)) continue;
+            await client.SendAsync(line);
+        }
+    }
+}
+```
+
+---
+
+必要あれば、**`BinaryPrimitives` を使ったヘルパー拡張メソッド**（`SetKeepAlive`）に切り出した版も出します。
+
+了解。いま作っているものを「一枚でわかる」形で整理します。
+
+# これは何？
+
+**TCP 常時接続の死活監視つき通信基盤**。
+サーバーとクライアントが **行区切りテキスト**でやり取りしつつ、
+**アプリ層の心拍（PING/PONG）** と **OSのTCP KeepAlive** の二段構えで
+「相手が生きているか」を自動判定・自動復旧します。
+
+# 構成
+
+* **サーバー（HeartbeatTcpServer）**
+
+  * `TcpListener` で接続受付
+  * 接続ごとに `ClientSession` を作成
+  * **定期的に `PING\n` を送信**
+  * 受信ループで `PONG` や通常メッセージを処理
+  * **`heartbeatTimeout` を超えて応答がなければ切断**
+  * （任意）**TCP KeepAlive** を有効化（Windowsで詳細値を設定）
+
+* **クライアント（HeartbeatTcpClient）**
+
+  * `TcpClient` でサーバーへ接続
+  * **`PING` を受信したら即 `PONG` を返信**
+  * 通常メッセージはそのまま表示／アプリ処理
+  * 切断・エラー時は **指数バックオフで自動再接続**
+  * （任意）**TCP KeepAlive** を有効化
+
+# 何が嬉しい？
+
+* **即応性×確実性**
+
+  * アプリ層心拍 → 数秒〜十数秒で無応答を検出
+  * TCP KeepAlive → 異常終了やNAT越えでの“幽霊接続”検知をOSが補助
+* **堅牢**
+
+  * `async/await` ベースでブロッキングなし
+  * 再接続ループでネットワーク断から自動復帰
+* **軽量**
+
+  * テキスト行プロトコル（`\n`）
+  * KeepAlive設定は**ゼロアロケーション**（`BinaryPrimitives`）
+
+# 動作フロー（ざっくり）
+
+1. サーバー：接続を受けたらセッション生成、受信ループと心拍ループを開始
+2. 心拍ループ：`interval` ごとに `PING` 送信
+3. 受信ループ：`PONG` や通常メッセージを受信 → **最終応答時刻を更新**
+4. **`timeout` 超過**（最終応答なし）→ サーバーが切断＆クリーンアップ
+5. クライアント：切断検知 → **再接続**（1s→2s→…最大15sのバックオフ）
+
+# 設定パラメータ（目安）
+
+* サーバー
+
+  * `heartbeatInterval`: 10–30 秒
+  * `heartbeatTimeout`: `interval` の 2～3 倍（例：30–90 秒）
+* KeepAlive（Windows例）
+
+  * `keepAliveTimeMs`: 30,000
+  * `keepAliveIntervalMs`: 5,000
+    ※用途により調整（LANで速く、インターネットでやや長め）
+
+# 使いどころ
+
+* チャット・通知・ゲームなどの**常時接続**アプリ
+* **アイドルが長い**接続（NATやFWで切られがち）
+* **クライアントが不安定**（モバイル/無線）の環境
+
+# 注意点・拡張
+
+* 心拍は**誤検知防止**のため、**2連続ミス判定**や**Jitter**を入れる拡張も可
+* テキストではなく**長さプレフィクスのバイナリ**にするとフレーミングがより堅牢
+* メトリクス（RTT、失敗回数）を計測してログ/監視に出すと運用しやすい
+
+---
+
+このままでも実用レベルですが、**長さプレフィクス方式**や**メッセージルーター/ハンドラ**を載せた拡張版も作れます。必要なら続けて出します！
+
+いい流れです。その理解でOK。
+ここからは **「サーバー内の“サービス（DBや外部APIなど）が生きているか」** を“アプリ層ヘルスチェック”で確かめる拡張を入れます。
+
+# 方針（サクッと要約）
+
+* プロトコルを拡張して、クライアントが **`HEALTH?`** を送るとサーバーが
+  **依存サービスのチェック結果を集約して返す** 形にします。
+* 返答は1行JSON（行区切りプロトコルを維持）。
+  例：`HEALTH {"overall":"OK","checks":[{"name":"db","ok":true,"ms":12}...]}`
+
+---
+
+# 1) ヘルスチェックの最小インターフェイスと実装例
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
+
+public sealed record HealthItem(string Name, bool Ok, long ElapsedMs, string? Message = null);
+public sealed record HealthReport(string Overall, IReadOnlyList<HealthItem> Checks);
+
+public interface IHealthCheck
+{
+    string Name { get; }
+    Task<HealthItem> CheckAsync(CancellationToken ct);
+}
+
+public sealed class FuncHealthCheck : IHealthCheck
+{
+    private readonly Func<CancellationToken, Task> _probe;
+    public string Name { get; }
+
+    public FuncHealthCheck(string name, Func<CancellationToken, Task> probe)
+    {
+        Name = name; _probe = probe;
+    }
+
+    public async Task<HealthItem> CheckAsync(CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            await _probe(ct);
+            sw.Stop();
+            return new HealthItem(Name, ok: true, sw.ElapsedMilliseconds);
+        }
+        catch (Exception ex)
+        {
+            sw.Stop();
+            return new HealthItem(Name, ok: false, sw.ElapsedMilliseconds, ex.Message);
+        }
+    }
+}
+
+public sealed class HealthAggregator
+{
+    private readonly List<IHealthCheck> _checks = new();
+
+    public HealthAggregator Add(IHealthCheck check)
+    {
+        _checks.Add(check);
+        return this;
+    }
+
+    public async Task<HealthReport> RunAsync(TimeSpan perCheckTimeout, CancellationToken ct)
+    {
+        var items = new List<HealthItem>(_checks.Count);
+        foreach (var c in _checks)
+        {
+            try
+            {
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                cts.CancelAfter(perCheckTimeout);
+                items.Add(await c.CheckAsync(cts.Token));
+            }
+            catch (Exception ex)
+            {
+                items.Add(new HealthItem(c.Name, false, 0, $"runner: {ex.Message}"));
+            }
+        }
+
+        bool allOk = items.TrueForAll(i => i.Ok);
+        return new HealthReport(allOk ? "OK" : "FAIL", items);
+    }
+}
+```
+
+### 例：チェックの中身（用途別に差し替えてください）
+
+```csharp
+// 1) 外部HTTPの疎通確認（200番台ならOK）
+public static IHealthCheck HttpHealth(string name, string url, TimeSpan timeout)
+    => new FuncHealthCheck(name, async ct =>
+{
+    using var http = new HttpClient() { Timeout = timeout };
+    using var res = await http.GetAsync(url, ct);
+    res.EnsureSuccessStatusCode();
+});
+
+// 2) （任意）DBの簡易クエリ（例：SQL Server）
+// using Microsoft.Data.SqlClient; などを参照に追加してから：
+// public static IHealthCheck SqlHealth(string name, string connStr)
+//     => new FuncHealthCheck(name, async ct =>
+// {
+//     await using var conn = new SqlConnection(connStr);
+//     await conn.OpenAsync(ct);
+//     await using var cmd = new SqlCommand("SELECT 1", conn);
+//     _ = await cmd.ExecuteScalarAsync(ct);
+// });
+
+// 3) ファイル/ディレクトリの存在チェックなど
+public static IHealthCheck FileHealth(string name, string path)
+    => new FuncHealthCheck(name, ct =>
+{
+    if (!System.IO.File.Exists(path) && !System.IO.Directory.Exists(path))
+        throw new InvalidOperationException("not found");
+    return Task.CompletedTask;
+});
+```
+
+---
+
+# 2) サーバーに組み込む（既存の HeartbeatTcpServer の最小差分）
+
+* `HeartbeatTcpServer` に **`HealthAggregator` を保持**し、
+* 受信ループで **`HEALTH?`** を扱い → **JSON で返答**。
+
+```csharp
+// HeartbeatTcpServer フィールドに追加
+private readonly HealthAggregator _health = new();
+
+// コンストラクタ or Start前にチェックを登録（用途に合わせて）
+public HeartbeatTcpServer(
+    int port,
+    TimeSpan? heartbeatInterval = null,
+    TimeSpan? heartbeatTimeout = null)
+{
+    _listener = new TcpListener(IPAddress.Any, port);
+    _heartbeatInterval = heartbeatInterval ?? TimeSpan.FromSeconds(10);
+    _heartbeatTimeout = heartbeatTimeout ?? TimeSpan.FromSeconds(30);
+
+    // ★ ここをあなたの環境用に調整してください
+    _health
+        .Add(HttpHealth("external-api", "https://example.com/health", TimeSpan.FromSeconds(3)))
+        //.Add(SqlHealth("db", "<YourConnectionString>"))
+        .Add(FileHealth("local-storage", "C:\\Temp")); // 例
+}
+```
+
+受信ループ（`ClientSession.ReceiveLoopAsync`）に **分岐を1つ追加**：
+
+```csharp
+if (line == "HEALTH?")
+{
+    // 1チェックあたりのタイムアウト（例：2秒）
+    var report = await _server.HealthSnapshotAsync(TimeSpan.FromSeconds(2), ct);
+    var json = System.Text.Json.JsonSerializer.Serialize(report);
+    await _writer.WriteLineAsync($"HEALTH {json}").ConfigureAwait(false);
+    continue;
+}
+```
+
+`ClientSession` からサーバーの `_health` にアクセスするため、
+`ClientSession` のコンストラクタに **サーバー参照（or デリゲート）** を渡すか、
+以下のようなラッパーをサーバー側に追加：
+
+```csharp
+// HeartbeatTcpServer に追加
+internal async Task<HealthReport> HealthSnapshotAsync(TimeSpan perCheckTimeout, CancellationToken ct)
+    => await _health.RunAsync(perCheckTimeout, ct);
+```
+
+そして `new ClientSession(..., this, ct)` のように渡し、
+`ClientSession` 側に `private readonly HeartbeatTcpServer _server;` を持たせてください。
+（すでに長いので骨子だけにしましたが、差し込みは容易です。）
+
+---
+
+# 3) クライアントから問い合わせる
+
+クライアントに **`QueryHealthAsync()`** を追加して、
+`HEALTH?` を投げ → 1行JSONを受け取るだけ。
+
+```csharp
+using System.Text.Json;
+
+public sealed class HeartbeatTcpClient : IAsyncDisposable
+{
+    // ...既存コード...
+
+    public async Task<HealthReport?> QueryHealthAsync(CancellationToken ct = default)
+    {
+        if (_writer is null || _reader is null) throw new InvalidOperationException("Not connected.");
+
+        // リクエスト送信
+        await _writer.WriteLineAsync("HEALTH?").ConfigureAwait(false);
+
+        // 1行応答を待つ（タイムアウトを付けたい場合は WaitAsync を併用）
+        var line = await _reader.ReadLineAsync().WaitAsync(ct).ConfigureAwait(false);
+        if (line is null) return null;
+
+        // "HEALTH {json}" 形式を想定
+        const string prefix = "HEALTH ";
+        if (!line.StartsWith(prefix, StringComparison.Ordinal))
+            return null;
+
+        var json = line.Substring(prefix.Length);
+        return JsonSerializer.Deserialize<HealthReport>(json);
+    }
+}
+```
+
+**使い方（例）**：
+
+```csharp
+// どこかのタイミングで
+var report = await client.QueryHealthAsync();
+if (report is not null)
+{
+    Console.WriteLine($"overall={report.Overall}");
+    foreach (var c in report.Checks)
+        Console.WriteLine($" - {c.Name}: {(c.Ok ? "OK" : "FAIL")} ({c.ElapsedMs}ms) {c.Message}");
+}
+```
+
+---
+
+# 4) 何が分かるようになる？
+
+* これで **「TCPが生きている」＋「アプリ/依存の健全性」** を両方判定可能。
+* 例えば：
+
+  * `overall: FAIL` かつ `db: FAIL "timeout"` → **DBが死んでる**
+  * `overall: OK` → **サービスとして健全**（少なくとも定義したチェックは通過）
+
+---
+
+# 5) 運用のヒント
+
+* チェックの粒度は粗く（`SELECT 1` / 軽いHTTP `/healthz`）、**短時間**で返す
+* 1チェックあたりのタイムアウト（例：1–3秒）＋**総合の外形SLA** を設計
+* 結果を **ログ出力** したり **Prometheus/Grafana** に載せると便利
+* 必要なら `overall` を「OK / DEGRADED / FAIL」3値にして運用感に合わせる
+
+---
+
+これで「PC（プロセス）が起動しているか」→「アプリや依存サービスが本当に動いているか」まで確認できます。
+差し込み時に詰まりそうなら、あなたの既存コード断片を貼ってくれれば“ここにこの数行を追加”まで具体的に調整します。
+
+
+良い質問です。
+ここまでの仕組み（TCP＋アプリ層の心拍）に加えて、
+**Windows サービスそのもの（例：`MyService`）が動いているかどうか**を監視したい、という話ですね。
+
+---
+
+## ✅ 目的
+
+「指定した Windows サービスが実行中 (`Running`) か停止 (`Stopped`) かを、
+プログラム内から調べたい・監視したい」
+
+---
+
+## 💡 最もシンプルな方法：`System.ServiceProcess.ServiceController`
+
+.NET 標準ライブラリに用意されています。
+
+```csharp
+using System;
+using System.ServiceProcess;
+
+public static class ServiceMonitor
+{
+    public static bool IsServiceRunning(string serviceName, string machineName = ".")
+    {
+        try
+        {
+            using var sc = new ServiceController(serviceName, machineName);
+            return sc.Status == ServiceControllerStatus.Running;
+        }
+        catch (InvalidOperationException)
+        {
+            // サービスが存在しない
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ServiceMonitor] {ex.Message}");
+            return false;
+        }
+    }
+}
+```
+
+### 使用例
+
+```csharp
+bool alive = ServiceMonitor.IsServiceRunning("Spooler"); // 印刷スプーラー
+Console.WriteLine(alive ? "サービス起動中" : "サービス停止中");
+```
+
+* `machineName` に `"."`（ローカル）またはリモートホスト名を指定可。
+* リモート監視にはそのホストで管理者権限＋RPC許可が必要。
+
+---
+
+## 🚀 サービス監視を「ヘルスチェック」に統合する例
+
+先ほどの `HealthAggregator` に組み込めます：
+
+```csharp
+public static IHealthCheck WindowsServiceHealth(string serviceName, string? machineName = null)
+    => new FuncHealthCheck($"svc:{serviceName}", async ct =>
+{
+    await Task.Yield(); // async署名のため
+    if (!ServiceMonitor.IsServiceRunning(serviceName, machineName ?? "."))
+        throw new InvalidOperationException("Service not running");
+});
+```
+
+### 登録例
+
+```csharp
+_health
+    .Add(WindowsServiceHealth("Spooler"))
+    .Add(WindowsServiceHealth("MyAppService"));
+```
+
+→ `HEALTH?` コマンドで、以下のような結果が返る：
+
+```json
+{
+  "overall": "FAIL",
+  "checks": [
+    { "name": "svc:Spooler", "ok": true, "elapsedMs": 2 },
+    { "name": "svc:MyAppService", "ok": false, "elapsedMs": 1, "message": "Service not running" }
+  ]
+}
+```
+
+---
+
+## ⚙️ 応用
+
+| 要件                  | 方法                                                                  |
+| ------------------- | ------------------------------------------------------------------- |
+| **リモートサーバーのサービス状態** | `new ServiceController(name, "server01")` でRPC接続（ファイアウォールでRPC許可が必要） |
+| **管理者権限不要で確認したい**   | サービス自体に `/health` API を作り、HTTP経由で監視                                 |
+| **停止していたら自動再起動したい** | `sc.Start()` を呼ぶ or PowerShell スクリプトで制御（要管理者）                       |
+| **複数サービスの一括監視**     | `GetServices()` で列挙、LINQで状態を抽出して `HealthAggregator` にまとめる           |
+
+---
+
+## 🧩 まとめ
+
+| 検出レベル      | 仕組み                               | 検出対象                  |
+| ---------- | --------------------------------- | --------------------- |
+| OS／プロセス    | TCP／KeepAlive／PING                | プロセス・接続自体が生きているか      |
+| アプリ／サービス内部 | `HEALTH?` 拡張（HTTP, DB, File etc.） | 業務処理の健全性              |
+| OSサービス     | `ServiceController`               | 特定の Windows サービスが起動中か |
+
+---
+
+必要なら、この Windows サービス監視を**定期的にサーバー側で自動チェックして、結果をクライアントに push 通知**する拡張（例えば `"ALERT svc:MyService stopped"`）も作れます。
+その方向にも進めますか？
+
+とてもいい質問です。
+`ServiceControllerStatus`（`System.ServiceProcess` 名前空間）には、
+実は **2つ（Running / Stopped）だけでなく、全部で 6種類** の状態があります。
+
+---
+
+## 🧩 一覧：`ServiceControllerStatus` の全列挙値
+
+| 値                   | 意味          | 補足                           |
+| ------------------- | ----------- | ---------------------------- |
+| **Stopped**         | サービスが停止している | 完全に停止済み。`Start()` 可能な状態。     |
+| **StartPending**    | サービスを開始中    | まだ起動処理が完了していない（初期化中など）。      |
+| **StopPending**     | サービスを停止中    | 終了処理の途中。                     |
+| **Running**         | サービスが実行中    | 通常の「稼働中」状態。                  |
+| **ContinuePending** | 一時停止から再開中   | `Continue()` 呼び出し後、再開処理中。    |
+| **PausePending**    | 一時停止処理中     | `Pause()` 呼び出し後、まだ停止完了していない。 |
+| **Paused**          | サービスが一時停止中  | 一時停止完了後の安定状態。                |
+
+---
+
+## 💡 実際の使い方の目安
+
+```csharp
+using System.ServiceProcess;
+
+using var sc = new ServiceController("Spooler");
+
+switch (sc.Status)
+{
+    case ServiceControllerStatus.Running:
+        Console.WriteLine("実行中");
+        break;
+    case ServiceControllerStatus.Stopped:
+        Console.WriteLine("停止中");
+        break;
+    case ServiceControllerStatus.Paused:
+        Console.WriteLine("一時停止中");
+        break;
+    case ServiceControllerStatus.StartPending:
+    case ServiceControllerStatus.ContinuePending:
+        Console.WriteLine("起動処理中...");
+        break;
+    case ServiceControllerStatus.StopPending:
+    case ServiceControllerStatus.PausePending:
+        Console.WriteLine("停止処理中...");
+        break;
+}
+```
+
+---
+
+## ✅ 「生きている」と判定する基準
+
+多くの場合は以下のように簡略化して扱います：
+
+```csharp
+bool IsServiceAlive(ServiceController sc)
+{
+    return sc.Status == ServiceControllerStatus.Running ||
+           sc.Status == ServiceControllerStatus.StartPending ||
+           sc.Status == ServiceControllerStatus.ContinuePending;
+}
+```
+
+つまり、「起動中」または「再開中」も「生きている」とみなします。
+
+---
+
+## ⚙️ 状態更新の注意点
+
+* `sc.Status` はキャッシュされているので、
+  **最新状態を取得するには `sc.Refresh()` が必要** です。
+  例：
+
+  ```csharp
+  sc.Refresh();
+  Console.WriteLine(sc.Status);
+  ```
+
+* 状態遷移を待ちたい場合は `WaitForStatus(...)` が便利です：
+
+  ```csharp
+  sc.Start();
+  sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(10));
+  ```
+
+---
+
+## 🧭 まとめ
+
+| 状態                                        | 説明         | 生きてる扱い？  |
+| ----------------------------------------- | ---------- | -------- |
+| `Running`                                 | 実行中        | ✅        |
+| `StartPending` / `ContinuePending`        | 起動／再開中     | ✅（動作準備中） |
+| `Stopped`                                 | 完全停止       | ❌        |
+| `StopPending` / `PausePending` / `Paused` | 停止または一時停止中 | ❌        |
+
+---
+
+ご希望があれば、
+💡「特定サービスの状態を監視し、停止検知で再起動 or 通知する」
+コード例（タイマー常駐型）も示せます。出してみましょうか？
+
+了解！
+**「特定の Windows サービスを常時監視し、止まってたら自動再起動（＋通知）」**する最小～実用コードです。
+コンソール常駐で動かせます（必要なら Windows サービス化もOK）。
+
+---
+
+# ✅ できること
+
+* 指定サービスの状態を一定間隔で監視（`Running` 以外を検知）
+* `Stopped` / `Paused` なら **自動復旧**（`Start()` / `Continue()`）
+* 復旧に失敗したら **Windows イベントログに記録**（権限ない場合は標準出力へ）
+* 安全な待機（`WaitForStatus`）とリトライ回数・間隔の調整
+
+---
+
+# 🧩 監視・自動復旧コード（.NET 6+ / C# 10 目安）
+
+```csharp
+using System;
+using System.Diagnostics;
+using System.ServiceProcess;
+using System.Threading;
+using System.Threading.Tasks;
+
+public sealed class ServiceWatchdog
+{
+    private readonly string _serviceName;
+    private readonly string _machineName;
+    private readonly TimeSpan _checkInterval;
+    private readonly int _maxRestartRetries;
+    private readonly TimeSpan _statusWait;      // Start/Continue 後に Running を待つ時間
+    private readonly bool _autoRecover;         // 停止/一時停止を自動復旧するか
+    private readonly string _eventSource;       // イベントログのソース名
+
+    public ServiceWatchdog(
+        string serviceName,
+        string machineName = ".",
+        TimeSpan? checkInterval = null,
+        int maxRestartRetries = 3,
+        TimeSpan? statusWait = null,
+        bool autoRecover = true,
+        string? eventSource = null)
+    {
+        _serviceName = serviceName;
+        _machineName = machineName;
+        _checkInterval = checkInterval ?? TimeSpan.FromSeconds(10);
+        _maxRestartRetries = Math.Max(0, maxRestartRetries);
+        _statusWait = statusWait ?? TimeSpan.FromSeconds(15);
+        _autoRecover = autoRecover;
+        _eventSource = eventSource ?? $"SvcWatchdog-{serviceName}";
+        TryEnsureEventSource();
+    }
+
+    public async Task RunAsync(CancellationToken ct)
+    {
+        LogInfo($"Watch start: service='{_serviceName}', machine='{_machineName}'");
+
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await CheckOnceAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                LogError($"Unexpected error: {ex.Message}");
+            }
+
+            try { await Task.Delay(_checkInterval, ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { break; }
+        }
+
+        LogInfo("Watch stopped.");
+    }
+
+    private async Task CheckOnceAsync(CancellationToken ct)
+    {
+        using var sc = new ServiceController(_serviceName, _machineName);
+        sc.Refresh();
+
+        var st = sc.Status;
+        // 起動処理中／停止処理中は次周期へ
+        if (st is ServiceControllerStatus.StartPending or ServiceControllerStatus.StopPending
+                or ServiceControllerStatus.PausePending or ServiceControllerStatus.ContinuePending)
+        {
+            LogDebug($"Pending... Status={st}");
+            return;
+        }
+
+        if (st == ServiceControllerStatus.Running)
+        {
+            LogDebug("Running");
+            return;
+        }
+
+        // Paused / Stopped など → 自動復旧する
+        if (!_autoRecover)
+        {
+            LogWarn($"Not running: Status={st}");
+            return;
+        }
+
+        for (int attempt = 1; attempt <= _maxRestartRetries; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                sc.Refresh();
+                st = sc.Status;
+
+                if (st == ServiceControllerStatus.Paused)
+                {
+                    LogWarn($"Service paused. Trying Continue() (attempt {attempt}/{_maxRestartRetries})");
+                    sc.Continue();
+                    sc.WaitForStatus(ServiceControllerStatus.Running, _statusWait);
+                }
+                else if (st != ServiceControllerStatus.Running)
+                {
+                    LogWarn($"Service not running (Status={st}). Trying Start() (attempt {attempt}/{_maxRestartRetries})");
+                    sc.Start();
+                    sc.WaitForStatus(ServiceControllerStatus.Running, _statusWait);
+                }
+
+                sc.Refresh();
+                if (sc.Status == ServiceControllerStatus.Running)
+                {
+                    LogInfo("Recovery success: Running");
+                    return;
+                }
+
+                LogWarn($"Recovery attempt finished but status={sc.Status}");
+            }
+            catch (InvalidOperationException ex)
+            {
+                LogError($"Service control error: {ex.Message}");
+            }
+            catch (System.ComponentModel.Win32Exception ex)
+            {
+                LogError($"Insufficient privileges or control denied: {ex.Message}");
+            }
+            catch (System.ServiceProcess.TimeoutException)
+            {
+                LogWarn($"WaitForStatus timeout (>{_statusWait.TotalSeconds}s)");
+            }
+            catch (Exception ex)
+            {
+                LogError($"Recovery attempt error: {ex.Message}");
+            }
+
+            // 次の試行まで待機（指数バックオフの簡易版）
+            try { await Task.Delay(TimeSpan.FromSeconds(5 * attempt), ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+        }
+
+        LogError($"Recovery FAILED after {_maxRestartRetries} attempts.");
+    }
+
+    #region Logging (EventLog → Console フォールバック)
+    private void TryEnsureEventSource()
+    {
+        try
+        {
+            const string logName = "Application";
+            if (!EventLog.SourceExists(_eventSource))
+                EventLog.CreateEventSource(_eventSource, logName);
+        }
+        catch
+        {
+            // 権限がない場合は作成できない → Console にフォールバック
+        }
+    }
+
+    private void WriteEvent(string msg, EventLogEntryType type)
+    {
+        try { EventLog.WriteEntry(_eventSource, msg, type); }
+        catch { Console.WriteLine($"{DateTime.Now:O} [{type}] {msg}"); }
+    }
+
+    private void LogInfo(string m) => WriteEvent(m, EventLogEntryType.Information);
+    private void LogWarn(string m) => WriteEvent(m, EventLogEntryType.Warning);
+    private void LogError(string m) => WriteEvent(m, EventLogEntryType.Error);
+    private void LogDebug(string m)
+    {
+#if DEBUG
+        WriteEvent(m, EventLogEntryType.Information);
+#endif
+    }
+    #endregion
+}
+```
+
+## 起動コード（Ctrl+C で終了）
+
+```csharp
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+
+class Program
+{
+    static async Task Main()
+    {
+        using var cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+        // ★監視したいサービス名に置き換え
+        var watchdog = new ServiceWatchdog(
+            serviceName: "Spooler",        // 例: 印刷スプーラー
+            machineName: ".",              // または "SERVER01"
+            checkInterval: TimeSpan.FromSeconds(10),
+            maxRestartRetries: 3,
+            statusWait: TimeSpan.FromSeconds(15),
+            autoRecover: true
+        );
+
+        await watchdog.RunAsync(cts.Token);
+    }
+}
+```
+
+---
+
+## 🔐 権限とネットワーク注意
+
+* **サービス状態の取得**は一般ユーザーでも見えることが多いですが、
+  **`Start/Stop/Continue` などの制御は管理者権限が必要**です。
+* **リモート監視**（`machineName` にホスト名指定）は、
+  対象側の **ファイアウォール（RPC/サービス制御マネージャ）** 許可と資格情報が必要です。
+
+---
+
+## 🧪 動作確認のコツ
+
+* 監視対象を `Spooler` にして、`services.msc` から一時停止/停止してログ出力や自動復旧を確認。
+* 本番導入時は **専用サービスアカウント**＋**最小権限**で運用を。
+
+---
+
+## 🔧 もっとやるなら
+
+* 連続失敗回数のメトリクス化（イベントログIDやPrometheusなど）
+* 復旧に失敗したら **メール/Slack/Webhook** 通知
+* 依存サービス（DB/HTTP）チェックと **まとめて overall 判定**（前回までのヘルス拡張と統合）
+
+必要なら **Windows サービス（`WorkerService`）化テンプレ** も用意します。
