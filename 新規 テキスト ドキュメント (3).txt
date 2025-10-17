@@ -1,0 +1,99 @@
+いいところに気づきました 👀
+はい、C# の `TcpListener` や `TcpClient` で「接続中かどうか（Connected）」や「生きてるか（IsAlive）」を知りたいという話ですね。
+ただし — **ここは注意が必要なポイント** です。
+
+---
+
+## 💡 まず前提
+
+### `TcpClient.Connected` プロパティ
+
+```csharp
+client.Connected
+```
+
+これは **「最後に送受信した時点で接続されていたか」** を返します。
+リアルタイムな状態ではありません。つまり：
+
+| 状況             | `Connected` の値         |
+| -------------- | ---------------------- |
+| 接続直後           | `true`                 |
+| 相手が正常に切断       | `false`                |
+| 相手が異常終了／ケーブル抜け | **しばらく `true` のまま！** ❌ |
+
+👉 つまり「接続が切れたかどうかの正確な検出には使えない」。
+
+---
+
+## ✅ 代わりの正しいやり方
+
+### ① 軽い ping／ポーリング（受信チェック）
+
+```csharp
+bool IsConnected(TcpClient client)
+{
+    try
+    {
+        if (client.Client.Poll(0, SelectMode.SelectRead))
+        {
+            return client.Client.Available != 0;
+        }
+        return true;
+    }
+    catch
+    {
+        return false;
+    }
+}
+```
+
+* `Poll(0, SelectMode.SelectRead)` が `true` かつ `Available == 0` のときは、相手が切断済み。
+* 非ブロッキングで軽いチェックができます。
+
+---
+
+### ② 定期的な送信テスト（“心拍”方式）
+
+サーバー → クライアントに定期的に軽い ping パケットを送って応答を見ます。
+（例：`PING` 送って、応答が `PONG` なら生きている。）
+
+これは「常時接続・長期アイドル状態を維持する」系のアプリ（チャットやWebSocket風など）でよく使います。
+
+---
+
+### ③ WeakReference で `IsAlive` を見る
+
+`WeakReference` は **GC（ガベージコレクション）対象かどうか** を確認するためのもので、
+TCP接続の「生死」とは無関係です。
+
+```csharp
+WeakReference<TcpClient> weak = new(client);
+...
+if (weak.TryGetTarget(out var cli) && cli.Connected) { ... }
+```
+
+これは「オブジェクトがGCで消されたか」だけを判定できますが、
+**ソケットの接続状態とは別次元**の話です。
+したがって「WeakReference.IsAlive」では「接続中かどうか」は判断できません。
+
+---
+
+## ⚙️ 実践的まとめ
+
+| 方法                      | 判定内容         | 適用例          | 備考        |
+| ----------------------- | ------------ | ------------ | --------- |
+| `client.Connected`      | 最後の送受信時点の状態  | 単発通信         | 遅延判定になる   |
+| `Poll(0, SelectRead)`   | ソケットレベルで即時判定 | TCPサーバー      | 実用的 👍    |
+| “PING/PONG”             | アプリレベル心拍監視   | 長期接続（チャットなど） | もっとも信頼性高い |
+| `WeakReference.IsAlive` | GC生存確認のみ     | メモリ監視用       | 接続とは無関係 ❌ |
+
+---
+
+もし、あなたのサーバーで「クライアント切断を検出してクリーンアップしたい」なら、
+`Poll(0, SelectMode.SelectRead)`＋`Available == 0` を一定間隔で監視するのが最もシンプルです。
+
+---
+
+必要なら、「サーバー側で接続リストをConcurrentBagに保持し、
+定期的に死んだクライアントを削除する」実装例も書けます。
+出してみましょうか？
