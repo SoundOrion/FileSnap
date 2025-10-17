@@ -43,16 +43,19 @@ public sealed class SnapshotWorker : BackgroundService
                 var fi = new FileInfo(path);
                 if (!fi.Exists) return;
 
-                await using var fs = new FileStream(
-                    path,
-                    FileMode.Open,
-                    FileAccess.Read,
-                    FileShare.ReadWrite | FileShare.Delete,
-                    bufferSize: 1024 * 64,
-                    options: FileOptions.Asynchronous | FileOptions.SequentialScan);
+                // 大きなフォルダ向け最適化：まずは mtime/size だけ
+                byte[] hash = Array.Empty<byte>();
 
-                // .NET 8: 非同期で SHA256
-                byte[] hash = await SHA256.HashDataAsync(fs, token);
+                //await using var fs = new FileStream(
+                //    path,
+                //    FileMode.Open,
+                //    FileAccess.Read,
+                //    FileShare.ReadWrite | FileShare.Delete,
+                //    bufferSize: 1024 * 64,
+                //    options: FileOptions.Asynchronous | FileOptions.SequentialScan);
+
+                //// .NET 8: 非同期で SHA256
+                //byte[] hash = await SHA256.HashDataAsync(fs, token);
 
                 bag.Add(new ArchiveInfo(
                     FilePath: path,
