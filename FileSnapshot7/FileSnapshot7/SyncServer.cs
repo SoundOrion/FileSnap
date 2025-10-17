@@ -10,9 +10,17 @@ using System.Threading.Channels;
 
 public sealed class SyncServer : BackgroundService
 {
-    private readonly ILogger<SyncServer> _log; private readonly IFileIndex _index;
-    private readonly int _port = 5001; private readonly int _maxClients = Math.Max(64, Environment.ProcessorCount * 128);
-    public SyncServer(ILogger<SyncServer> log, IFileIndex index) { _log = log; _index = index; }
+    private readonly ILogger<SyncServer> _log; 
+    private readonly IFileIndex _index;
+    private readonly int _port = 5001;
+    private readonly int _maxClients = Math.Max(64, Environment.ProcessorCount * 128);
+
+    public SyncServer(ILogger<SyncServer> log, IFileIndex index) 
+    {
+        _log = log; 
+        _index = index;
+        _maxClients = ServerTuning.EstimateMaxClients(); // 自動推定
+    }
 
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
