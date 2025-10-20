@@ -1,22 +1,20 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-
-namespace FileSnapshot7;
-
-// LegacyCompatFraming.cs
-// - 元方式と互換: 内側ヘッダ = Int32(±payloadSize). 正=非圧縮, 負=圧縮
-// - その後、全体バイト列(senddata)を 65532 バイトで分割し、各チャンクを [len(LE)][payload] で送出
-// - EOF フレームはありません（元方式どおり）
-// - エンディアンは Little Endian 固定（BinaryPrimitives）
-
 using System.Buffers.Binary;
 using System.IO.Compression;
 using System.Net.Sockets;
 using System.Text;
 
+namespace FileSnapshot7;
+
+/// <summary>
+/// - 元方式と互換: 内側ヘッダ = Int32(±payloadSize). 正=非圧縮, 負=圧縮
+/// - その後、全体バイト列(senddata)を 65532 バイトで分割し、各チャンクを [len(LE)][payload] で送出
+/// - EOF フレームはありません（元方式どおり）
+/// - エンディアンは Little Endian 固定（BinaryPrimitives）
+/// 理論上の最大通信サイズ 約 2.1GB（int.MaxValue）
+/// 実用上の安全サイズ 数十MB程度
+/// </summary>
 public static class LegacyCompatFraming
 {
     public const int OuterChunkMax = 65532; // 元コード互換
