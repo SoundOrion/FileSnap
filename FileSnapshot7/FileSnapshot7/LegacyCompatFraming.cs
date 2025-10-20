@@ -72,7 +72,16 @@ public static class LegacyCompatFraming
 
     /// <summary>
     /// 指定された文字列をネットワークストリームに送信します。
+    /// <para>
+    /// 内部的には文字列を <see cref="TextEncoding"/>（既定は UTF-8）でバイト配列に変換し、
+    /// <see cref="SendMessageAsync"/> を使用して送信します。<br/>
+    /// 圧縮や分割送信などの詳細なフレーミング処理は <see cref="SendMessageAsync"/> に委譲されます。
+    /// </para>
     /// </summary>
+    /// <param name="ns">送信先の <see cref="NetworkStream"/>。</param>
+    /// <param name="text">送信する文字列。null の場合は空文字列として扱われます。</param>
+    /// <param name="ct">キャンセル操作を制御する <see cref="CancellationToken"/>。</param>
+    /// <returns>非同期操作を表す <see cref="Task"/>。</returns>
     public static Task SendStringAsync(NetworkStream ns, string text, CancellationToken ct = default)
         => SendMessageAsync(ns, TextEncoding.GetBytes(text ?? string.Empty), ct);
 
@@ -144,7 +153,17 @@ public static class LegacyCompatFraming
 
     /// <summary>
     /// ネットワークストリームから1つのメッセージを受信し、対応する文字列を返します。
+    /// <para>
+    /// 内部的には <see cref="ReceiveMessageAsync"/> によりバイト列を受信し、
+    /// <see cref="TextEncoding"/>（既定は UTF-8）で文字列にデコードして返します。<br/>
+    /// 圧縮データの場合は自動的に解凍されます。
+    /// </para>
     /// </summary>
+    /// <param name="ns">受信元の <see cref="NetworkStream"/>。</param>
+    /// <param name="ct">キャンセル操作を制御する <see cref="CancellationToken"/>。</param>
+    /// <returns>受信したメッセージを文字列として返す非同期タスク。</returns>
+    /// <exception cref="EndOfStreamException">ストリームが途中で切断された場合にスローされます。</exception>
+    /// <exception cref="InvalidDataException">データ形式が不正な場合にスローされます。</exception>
     public static async Task<string> ReceiveStringAsync(NetworkStream ns, CancellationToken ct = default)
         => TextEncoding.GetString(await ReceiveMessageAsync(ns, ct));
 
