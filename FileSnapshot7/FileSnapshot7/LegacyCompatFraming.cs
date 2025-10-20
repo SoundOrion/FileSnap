@@ -8,12 +8,16 @@ using System.Text;
 namespace FileSnapshot7;
 
 /// <summary>
-/// - 元方式と互換: 内側ヘッダ = Int32(±payloadSize). 正=非圧縮, 負=圧縮
-/// - その後、全体バイト列(senddata)を 65532 バイトで分割し、各チャンクを [len(LE)][payload] で送出
-/// - EOF フレームはありません（元方式どおり）
-/// - エンディアンは Little Endian 固定（BinaryPrimitives）
-/// 理論上の最大通信サイズ 約 2.1GB（int.MaxValue）
-/// 実用上の安全サイズ 数十MB程度
+/// 旧方式との互換性を持つメッセージフレーミング処理を提供します。
+/// <para>
+/// - 内側ヘッダ形式: <c>Int32(±payloadSize)</c>。正の値は非圧縮、負の値は Deflate 圧縮を示します。<br/>
+/// - 全体のバイト列 (<c>senddata</c>) を 65532 バイト単位で分割し、各チャンクを <c>[len(LE)][payload]</c> 形式で送信します。<br/>
+/// - EOF フレームは存在しません（元仕様に準拠）。<br/>
+/// - エンディアンは <see cref="BinaryPrimitives"/> による Little Endian 固定です。<br/>
+/// <br/>
+/// 理論上の最大通信サイズは約 2.1GB（<see cref="int.MaxValue"/>）、<br/>
+/// 実用上の安全な通信サイズは数十MB程度です。
+/// </para>
 /// </summary>
 public static class LegacyCompatFraming
 {
