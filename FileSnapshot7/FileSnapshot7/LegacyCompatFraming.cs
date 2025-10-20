@@ -66,7 +66,9 @@ public static class LegacyCompatFraming
         await ns.FlushAsync(ct);
     }
 
-    // ---- 送信（文字列）----
+    /// <summary>
+    /// 指定された文字列をネットワークストリームに送信します。
+    /// </summary>
     public static Task SendStringAsync(NetworkStream ns, string text, CancellationToken ct = default)
         => SendMessageAsync(ns, TextEncoding.GetBytes(text ?? string.Empty), ct);
 
@@ -136,7 +138,9 @@ public static class LegacyCompatFraming
         }
     }
 
-    // ---- 受信（文字列）----
+    /// <summary>
+    /// ネットワークストリームから1つのメッセージを受信し、対応する文字列を返します。
+    /// </summary>
     public static async Task<string> ReceiveStringAsync(NetworkStream ns, CancellationToken ct = default)
         => TextEncoding.GetString(await ReceiveMessageAsync(ns, ct));
 
