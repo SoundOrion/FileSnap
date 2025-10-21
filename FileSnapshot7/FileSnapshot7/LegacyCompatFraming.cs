@@ -478,3 +478,89 @@ class Program
         }
     }
 }
+
+// using System.Buffers.Binary;
+// using System.IO.Compression;
+
+public static async Task<byte[]> ReceiveMessageAsync(
+    NetworkStream ns,
+    bool acceptHeaderlessRawSingleChunk = false, // ← 旧挙動を許容するなら true
+    CancellationToken ct = default)
+    {
+        // 外側フレームを読み足していく
+        using var buffer = new MemoryStream(capacity: 4 + 64 * 1024);
+        int? innerNeeded = null;
+        bool innerCompressed = false;
+
+        // まず最初の外側フレームを読む
+        int? maybeLen = await ReadInt32LEAsync(ns, ct);
+        if (maybeLen is null) throw new EndOfStreamException("stream closed while reading frame length");
+        int firstLen = maybeLen.Value;
+        if (firstLen <= 0 || firstLen > OuterChunkMax) throw new InvalidDataException($"bad outer frame length {firstLen}");
+
+        var first = new byte[firstLen];
+        await ReadExactAsync(ns, first, firstLen, ct);
+        buffer.Write(first, 0, firstLen);
+
+        // ★ レガシー互換分岐：1チャンク・非圧縮・ヘッダなし を“推定”できるならそのまま返す
+        // 先頭4Bをサイズと解釈したときに「この外側チャンク内に収まらない値（ありえない）」なら、
+        // それはヘッダではなく“生データ”の先頭4Bと推定できる。
+        if (acceptHeaderlessRawSingleChunk && buffer.Length >= 4)
+        {
+            int probe = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(buffer.GetBuffer(), 0, 4));
+            long room = buffer.Length - 4;             // ヘッダがあるなら payload が入るべき残り
+            long need = Math.Abs((long)probe);
+
+            // 条件: probe が 0 以下 or room に収まらない → この4Bはヘッダとして不自然
+            // ※ 圧縮(-size)はこの時点ではありえない（旧挙動は“生”のみ省略）
+            if (probe <= 0 || need > room)
+            {
+                // 旧実装の「生+1チャンク＝ヘッダなし」ケースとみなして、このチャンク全体をメッセージ本体として返す
+                var raw = buffer.ToArray();
+                return raw; // 非圧縮・ヘッダなし
+            }
+            // ここを通らない＝標準どおりヘッダありとして続行
+        }
+
+        // --- 標準挙動：内側ヘッダありとして処理（新旧の“正規仕様”） ---
+        // 以降は既存の ReceiveMessageAsync と同じ流れ:contentReference[oaicite:1]{index=1}
+        // 1) 先頭4B（内側ヘッダ）を読む
+        if (buffer.Length < 4)
+            throw new InvalidDataException("inner header missing");
+        {
+            var all = buffer.GetBuffer();
+            int inner = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(all, 0, 4));
+            innerCompressed = inner < 0;
+            innerNeeded = Math.Abs(inner);
+            if (innerNeeded.Value > int.MaxValue)
+                throw new InvalidDataException($"inner size too large: {innerNeeded.Value}");
+        }
+
+        // 2) 必要バイトが満たされるまで外側フレームを読み足す
+        while (buffer.Length < 4L + innerNeeded.Value)
+        {
+            int? len = await ReadInt32LEAsync(ns, ct);
+            if (len is null) throw new EndOfStreamException("stream closed while reading frame length");
+            if (len <= 0 || len > OuterChunkMax) throw new InvalidDataException($"bad outer frame length {len}");
+            var tmp = new byte[len.Value];
+            await ReadExactAsync(ns, tmp, len.Value, ct);
+            buffer.Write(tmp, 0, len.Value);
+        }
+
+        // 3) 復元（負なら Deflate 展開、正なら生コピー）
+        buffer.Position = 4;
+        if (innerCompressed)
+        {
+            using var def = new DeflateStream(buffer, CompressionMode.Decompress, leaveOpen: true);
+            using var outMs = new MemoryStream();
+            await def.CopyToAsync(outMs, ct);
+            return outMs.ToArray();
+        }
+        else
+        {
+            var result = new byte[innerNeeded!.Value];
+            int read = await buffer.ReadAsync(result, ct);
+            if (read != result.Length) throw new InvalidDataException("unexpected end while reading raw payload");
+            return result;
+        }
+    }
