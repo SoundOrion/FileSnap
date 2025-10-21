@@ -1,6 +1,7 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.Buffers.Binary;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO.Compression;
 using System.Net.Sockets;
 using System.Text;
@@ -439,4 +440,41 @@ public static async Task SendMessageAsync(
         offset += len;
     }
     await ns.FlushAsync(ct);
+}
+
+using System;
+using System.Diagnostics;
+
+class Program
+{
+    static void Main()
+    {
+        string comspec = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe";
+        // UNC パス（例）： \\server\share\script.vbs
+        string uncDir = @"\\server\share";
+        string scriptName = "script.vbs";
+        // pushd で UNC をドライブに割り当て -> cscript 実行 -> popd で戻す
+        string cmd = $"/c pushd \"{uncDir}\" && cscript //nologo \"{scriptName}\" arg1 arg2 && popd";
+
+        var psi = new ProcessStartInfo(comspec, cmd)
+        {
+            UseShellExecute = false,         // 出力を読み取るなら false
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+
+        using var p = Process.Start(psi) ?? throw new InvalidOperationException("起動失敗");
+        string stdout = p.StandardOutput.ReadToEnd();
+        string stderr = p.StandardError.ReadToEnd();
+        p.WaitForExit();
+
+        Console.WriteLine("STDOUT:");
+        Console.WriteLine(stdout);
+        if (!string.IsNullOrEmpty(stderr))
+        {
+            Console.WriteLine("STDERR:");
+            Console.WriteLine(stderr);
+        }
+    }
 }
