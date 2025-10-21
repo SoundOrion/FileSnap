@@ -381,3 +381,62 @@ public static partial class LegacyCompatFraming
         }
     }
 }
+
+public enum LegacyInnerHeaderMode
+{
+    Standard,                 // これまで通り: 常に [±size][payload] を付ける
+    OmitWhenRawSingleChunk    // 非圧縮 かつ 1チャンクで収まる時は内側ヘッダを省略
+}
+
+public static async Task SendMessageAsync(
+    NetworkStream ns,
+    byte[] data,
+    LegacyInnerHeaderMode headerMode = LegacyInnerHeaderMode.Standard,
+    CancellationToken ct = default)
+{
+    if (data is null) throw new ArgumentNullException(nameof(data));
+
+    // 1) 圧縮を試し、短い方を選択（現行仕様）
+    byte[] compData;
+    using (var ms = new MemoryStream())
+    {
+        using (var def = new DeflateStream(ms, CompressionMode.Compress, leaveOpen: true))
+            await def.WriteAsync(data, ct);
+        compData = ms.ToArray();
+    }
+    bool useRaw = data.Length <= compData.Length;
+    var payload = useRaw ? data : compData;
+
+    // 2) 内側ヘッダを付けるかの判定
+    bool isSingleChunk = (4 + payload.Length) <= OuterChunkMax; // 内側ヘッダ有り想定時の総量
+    bool omitInnerHeader =
+        headerMode == LegacyInnerHeaderMode.OmitWhenRawSingleChunk
+        && useRaw
+        && isSingleChunk;
+
+    byte[] senddata;
+    if (omitInnerHeader)
+    {
+        // レガシー互換：生+1チャンク時は内側ヘッダを省略し、payload だけを外側フレーム化
+        senddata = payload;
+    }
+    else
+    {
+        // 標準: [4B:±size(LE)] + payload
+        int innerSize = useRaw ? payload.Length : -payload.Length;
+        senddata = new byte[4 + payload.Length];
+        BinaryPrimitives.WriteInt32LittleEndian(senddata.AsSpan(0, 4), innerSize);
+        Buffer.BlockCopy(payload, 0, senddata, 4, payload.Length);
+    }
+
+    // 3) 共通: 65532 で分割 → [4B:len(LE)][chunk] で送出（EOFなし）
+    int offset = 0;
+    while (offset < senddata.Length)
+    {
+        int len = Math.Min(OuterChunkMax, senddata.Length - offset);
+        await WriteInt32LEAsync(ns, len, ct);
+        await ns.WriteAsync(senddata.AsMemory(offset, len), ct);
+        offset += len;
+    }
+    await ns.FlushAsync(ct);
+}
