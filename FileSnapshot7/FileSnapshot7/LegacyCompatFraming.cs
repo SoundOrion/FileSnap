@@ -220,3 +220,164 @@ public static class LegacyCompatFraming
         }
     }
 }
+
+
+// LegacyCompatFraming.cs に追記
+using System.Buffers.Binary;
+using System.IO.Compression;
+
+public static partial class LegacyCompatFraming
+{
+    public static void EnqueueFrames(Queue<byte[]> q, byte[] data)
+    {
+        if (q is null) throw new ArgumentNullException(nameof(q));
+        if (data is null) throw new ArgumentNullException(nameof(data));
+
+        // 1) Deflate 圧縮（短い方を選ぶ）
+        byte[] comp;
+        using (var ms = new MemoryStream())
+        {
+            using (var def = new DeflateStream(ms, CompressionMode.Compress, leaveOpen: true))
+                def.Write(data, 0, data.Length);
+            comp = ms.ToArray();
+        }
+        bool useRaw = data.Length <= comp.Length;
+        var payload = useRaw ? data : comp;
+        int inner = useRaw ? payload.Length : -payload.Length;
+
+        // 2) senddata = [4B: inner(LE)] + payload
+        var send = new byte[4 + payload.Length];
+        BinaryPrimitives.WriteInt32LittleEndian(send.AsSpan(0, 4), inner);
+        Buffer.BlockCopy(payload, 0, send, 4, payload.Length);
+
+        // 3) 65532 で分割 → 各チャンクを [4B:len(LE)][chunk] でキューへ
+        int off = 0;
+        while (off < send.Length)
+        {
+            int len = Math.Min(OuterChunkMax, send.Length - off); // OuterChunkMax=65532
+            var frame = new byte[4 + len];
+            BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(0, 4), len);
+            Buffer.BlockCopy(send, off, frame, 4, len);
+            q.Enqueue(frame);
+            off += len;
+        }
+    }
+}
+
+// using 追加:
+// using System.Buffers.Binary;
+// using System.IO.Compression;
+
+public static partial class LegacyCompatFraming
+{
+    /// <summary>
+    /// 送信側：data を旧実装互換の「外側フレーム列」にして Queue に積む。
+    /// 仕様：内側ヘッダ = Int32(±payloadSize)、65532 分割、各チャンクは [4B:len(LE)][payload]。
+    /// </summary>
+    public static void EnqueueFrames(Queue<byte[]> q, byte[] data)
+    {
+        if (q is null) throw new ArgumentNullException(nameof(q));
+        if (data is null) throw new ArgumentNullException(nameof(data));
+
+        // 1) Deflate圧縮（短い方採用）
+        byte[] comp;
+        using (var ms = new MemoryStream())
+        {
+            using (var def = new DeflateStream(ms, CompressionMode.Compress, leaveOpen: true))
+                def.Write(data, 0, data.Length);
+            comp = ms.ToArray();
+        }
+        bool useRaw = data.Length <= comp.Length;
+        var payload = useRaw ? data : comp;
+        int inner = useRaw ? payload.Length : -payload.Length;
+
+        // 2) senddata = [4B: inner(LE)] + payload
+        var send = new byte[4 + payload.Length];
+        BinaryPrimitives.WriteInt32LittleEndian(send.AsSpan(0, 4), inner);
+        Buffer.BlockCopy(payload, 0, send, 4, payload.Length);
+
+        // 3) 65532 で分割し、各チャンクを [4B:len(LE)][chunk] で Enqueue
+        int off = 0;
+        while (off < send.Length)
+        {
+            int len = Math.Min(OuterChunkMax, send.Length - off);
+            var frame = new byte[4 + len];
+            BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(0, 4), len);
+            Buffer.BlockCopy(send, off, frame, 4, len);
+            q.Enqueue(frame);
+            off += len;
+        }
+    }
+
+    /// <summary>
+    /// 受信側：外側フレーム（[4B:len][chunk]）の Queue からちょうど1メッセージ分を復元。
+    /// 復元できたら true。足りなければ false（フレームは消費しない）。
+    /// </summary>
+    public static bool TryDequeueOneMessage(Queue<byte[]> q, out byte[] message)
+    {
+        if (q is null) throw new ArgumentNullException(nameof(q));
+
+        // ローカルバッファに積みながら様子を見る（不足時はロールバック）
+        var stash = new List<byte[]>();
+        using var buffer = new MemoryStream(capacity: 4 + 64 * 1024);
+
+        int? innerNeeded = null;
+        bool innerCompressed = false;
+
+        while (true)
+        {
+            if (q.Count == 0)
+            {
+                // フレーム不足：ロールバック（何も消費しない）
+                for (int i = stash.Count - 1; i >= 0; i--) q.Enqueue(stash[i]); // 逆順復帰は不要：今回は消費前に取り出していない
+                message = Array.Empty<byte>();
+                return false;
+            }
+
+            var frame = q.Peek(); // まず覗く（不足時に戻す必要がないように）
+            if (frame.Length < 4) throw new InvalidDataException("bad outer frame (length < 4)");
+            int len = BinaryPrimitives.ReadInt32LittleEndian(frame.AsSpan(0, 4));
+            if (len <= 0 || len > OuterChunkMax) throw new InvalidDataException($"bad outer frame length {len}");
+            if (frame.Length != 4 + len) throw new InvalidDataException("outer frame size mismatch");
+
+            // ここで消費確定
+            q.Dequeue();
+            stash.Add(frame);
+
+            // chunk を buffer に追記
+            buffer.Write(frame, 4, len);
+
+            // 内側ヘッダ（±size）未確定なら確定
+            if (innerNeeded == null && buffer.Length >= 4)
+            {
+                var all = buffer.GetBuffer();
+                int inner = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(all, 0, 4));
+                innerCompressed = inner < 0;
+                innerNeeded = Math.Abs(inner);
+                if (innerNeeded.Value < 0 || innerNeeded.Value > int.MaxValue)
+                    throw new InvalidDataException("invalid inner size");
+            }
+
+            // 必要量に到達（= 4 + innerNeeded）したら復元
+            if (innerNeeded != null && buffer.Length >= 4L + innerNeeded.Value)
+            {
+                buffer.Position = 4;
+                if (innerCompressed)
+                {
+                    using var def = new DeflateStream(buffer, CompressionMode.Decompress, leaveOpen: true);
+                    using var outMs = new MemoryStream();
+                    def.CopyTo(outMs);
+                    message = outMs.ToArray();
+                    return true;
+                }
+                else
+                {
+                    message = new byte[innerNeeded.Value];
+                    int read = buffer.Read(message, 0, message.Length);
+                    if (read != message.Length) throw new InvalidDataException("unexpected end of raw payload");
+                    return true;
+                }
+            }
+        }
+    }
+}
