@@ -1,0 +1,91 @@
+いいよ！`SendMessageAsync` に**速度制限（Mbps）**を“オプション”で付け足す形にすると扱いやすい。
+下の実装は、既存仕様（内側ヘッダ±サイズ → 65532Bで `[len(LE)][chunk]` に分割 → EOFなし）を**一切変えず**、書き込みのあとに**理論ペースと実経過時間を突き合わせて待機**するだけの安全なスロットリングです。 
+
+```csharp
+// using System.Buffers.Binary;
+// using System.Diagnostics;
+// using System.IO.Compression;
+
+public static async Task SendMessageAsync(
+    NetworkStream ns,
+    byte[] data,
+    double? maxMbps = null,                 // ← 追加: 送信レート上限（nullなら無制限）
+    CancellationToken ct = default)
+{
+    if (data is null) throw new ArgumentNullException(nameof(data));
+
+    // ---- 1) Deflate圧縮を試して短い方を採用（非圧縮=正, 圧縮=負）----
+    byte[] compData;
+    using (var ms = new MemoryStream())
+    {
+        using (var def = new DeflateStream(ms, CompressionMode.Compress, leaveOpen: true))
+            await def.WriteAsync(data, ct);
+        compData = ms.ToArray();
+    }
+    bool useRaw = data.Length <= compData.Length;
+    int innerSize = useRaw ? data.Length : -compData.Length;
+
+    // ---- 2) senddata = [4B: innerSize(LE)] + payload ----
+    var payload = useRaw ? data : compData;
+    var senddata = new byte[4 + payload.Length];
+    BinaryPrimitives.WriteInt32LittleEndian(senddata.AsSpan(0, 4), innerSize);
+    Buffer.BlockCopy(payload, 0, senddata, 4, payload.Length);
+
+    // ---- 3) 外側フレーム化: 65532Bで分割し [4B:len(LE)][chunk] で送信（EOFなし）----
+    // レート制御: 累計送信バイトに対して「期待経過時間」を計算して追従
+    var sw = Stopwatch.StartNew();
+    long sentBytes = 0;
+    double bytesPerSec = (maxMbps.HasValue && maxMbps.Value > 0)
+        ? maxMbps.Value * 125000.0   // 1 Mbps = 125,000 B/s
+        : double.PositiveInfinity;
+
+    int offset = 0;
+    while (offset < senddata.Length)
+    {
+        int len = Math.Min(OuterChunkMax, senddata.Length - offset); // 65532B 上限
+        // 3-1) 先にフレーム長(LE, 4B)を書き込み
+        await WriteInt32LEAsync(ns, len, ct);
+        // 3-2) チャンク本体を書き込み
+        await ns.WriteAsync(senddata.AsMemory(offset, len), ct);
+        offset += len;
+
+        // ---- レート制御（フレーム長4B + チャンクlen バイトでカウント）----
+        sentBytes += (4 + len);
+
+        if (bytesPerSec != double.PositiveInfinity)
+        {
+            double expectedMs = (sentBytes / bytesPerSec) * 1000.0;
+            double behindMs = expectedMs - sw.Elapsed.TotalMilliseconds;
+            if (behindMs > 0)
+            {
+                // CancellationTokenに対応
+                var delay = TimeSpan.FromMilliseconds(behindMs);
+                if (delay > TimeSpan.Zero)
+                    await Task.Delay(delay, ct);
+            }
+        }
+    }
+
+    await ns.FlushAsync(ct);
+}
+```
+
+### 使い方
+
+```csharp
+// 例: 上限 10 Mbps で送る
+await LegacyCompatFraming.SendMessageAsync(ns, buffer, maxMbps: 10.0, ct);
+
+// 無制限（既定値）で今まで通り
+await LegacyCompatFraming.SendMessageAsync(ns, buffer, null, ct);
+```
+
+### ポイント
+
+* **プロトコルは現状維持**：内側ヘッダ `Int32(±payloadSize)` を付け、**65532B** に分割して各チャンクを `[len(LE)][chunk]` で送る——既存仕様どおりです。 
+* **正確なスロットリング**：毎フレーム（= “4Bの長さ + チャンク本体”を書いた単位）で**送った累計バイト**から“理想的に必要な経過時間”を算出し、`Stopwatch` の実時間に足りなければ `Task.Delay`。瞬間的な揺れにも追従します。
+* **Flush は最後だけ**：各フレームごとに `Flush` せず、送信ループの最後で `Flush`。無駄なシステムコールを抑えます（必要なら中で適宜入れてOK）。
+
+このまま差し替えれば、**帯域を食い尽くさず**に、従来の**互換フレーミング**で安全に送出できます。受信側は既存の `ReceiveMessageAsync` がそのまま使えます（先頭4Bの**内側ヘッダ**を見て、必要バイトが**4 + abs(size)** 満たされるまで外側フレームを読み足し、負なら Deflate 解凍）。  
+
+必要なら「**ヘッダ省略のレガシー互換**」版ともコンパチにできますが、まずはこの“正規仕様 + レート制限”版で OK。
