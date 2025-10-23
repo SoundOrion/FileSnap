@@ -59,8 +59,8 @@ public static class LegacyCompatFraming
         Buffer.BlockCopy(payload, 0, senddata, 4, payload.Length);
 
         // 4) 64KB 以下は外側チャンク無しでそのまま送信
-        const int SixtyFourKB = 65536;
-        if (senddata.Length <= SixtyFourKB)
+        //if (senddata.Length <= OuterChunkMax + 4)
+        if (payload.Length <= OuterChunkMax)
         {
             await ns.WriteAsync(senddata, ct).ConfigureAwait(false);
             await ns.FlushAsync(ct).ConfigureAwait(false);
@@ -120,7 +120,7 @@ public static class LegacyCompatFraming
             {
                 // ---- 外側チャンクあり確定 ----
                 // 既に「最初の外側チャンク len=first の本体」を読み込んだので、これを起点に収集。
-                using var buffer = new MemoryStream(capacity: first + 4 + 64 * 1024);
+                using var buffer = new MemoryStream(capacity: firstBlock.Length + 4);
                 buffer.Write(firstBlock, 0, firstBlock.Length);
 
                 // 内側サイズを確定
