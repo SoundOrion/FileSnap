@@ -86,48 +86,51 @@ public static class LegacyCompatFraming
         => SendMessageAsync(ns, TextEncoding.GetBytes(text ?? string.Empty), ct);
 
     /// <summary>
-    /// 1 メッセージを受信し、元のバイト配列を返す。
-    /// (A) 外側チャンクなし（直送）と (B) 外側チャンクありの両方に対応して自動判別。
+    /// メッセージをストリームから受信します。
     /// </summary>
+    /// <param name="ns">受信元 NetworkStream。</param>
+    /// <param name="ct">キャンセル トークン。</param>
+    /// <returns>復元されたメッセージペイロード。</returns>
     public static async Task<byte[]> ReceiveMessageAsync(NetworkStream ns, CancellationToken ct = default)
     {
         if (ns is null) throw new ArgumentNullException(nameof(ns));
 
         // 先頭 4B を読む
         int? firstMaybe = await ReadInt32LEAsync(ns, ct).ConfigureAwait(false);
-        if (firstMaybe is null) throw new EndOfStreamException("stream closed while reading first 4 bytes");
+        if (firstMaybe is null)
+            throw new EndOfStreamException("stream closed while reading first 4 bytes");
         int first = firstMaybe.Value;
 
-        // ケース(A): 外側チャンクなし確定（= これは内側ヘッダ: ±payloadSize）
-        if (first <= 0 || first > OuterChunkMax)
+        // 1) first <= 0 → 直送(A)（負=圧縮、0=空）
+        // 2) 1..65531 → 直送(A)非圧縮（この実装の送信側ではチャンク開始は65532固定）
+        if (first < OuterChunkMax)
             return await ReceiveUnchunkedAfterHeaderAsync(ns, first, ct).ConfigureAwait(false);
 
-        // ケース(B)/(A) の曖昧領域: first ∈ [1, OuterChunkMax]
-        // ひとまず first バイトを読み込んで判定材料にする
-        var firstBlock = new byte[first];
-        await ReadExactAsync(ns, firstBlock, first, ct).ConfigureAwait(false);
-
-        // 「外側チャンクあり」なら、この firstBlock の先頭 4B は内側ヘッダ（±inner）。
-        // これを読み取って妥当性を確認する。
-        if (firstBlock.Length >= 4)
+        // 3) 65532 → 境界（直送(A) or チャンク(B)）
+        if (first == OuterChunkMax)
         {
-            int innerCandidate = BinaryPrimitives.ReadInt32LittleEndian(firstBlock.AsSpan(0, 4));
+            var peek4 = new byte[4];
+            await ReadExactAsync(ns, peek4, 4, ct).ConfigureAwait(false);
+            int innerCandidate = BinaryPrimitives.ReadInt32LittleEndian(peek4);
             long absInner = Math.Abs((long)innerCandidate);
 
-            // 64KB 超のメッセージのみ外側チャンク化する仕様:
-            // つまり inner の絶対値が OuterChunkMax を超えていなければ、直送であるはず。
             if (absInner > OuterChunkMax)
             {
-                // ---- 外側チャンクあり確定 ----
-                // 既に「最初の外側チャンク len=first の本体」を読み込んだので、これを起点に収集。
-                using var buffer = new MemoryStream(capacity: firstBlock.Length + 4);
-                buffer.Write(firstBlock, 0, firstBlock.Length);
+                // ---- チャンク(B) 確定 ----
+                using var buffer = new MemoryStream(capacity: OuterChunkMax + 4);
+                buffer.Write(peek4, 0, 4);
 
-                // 内側サイズを確定
                 bool innerCompressed = innerCandidate < 0;
-                long innerNeeded = Math.Abs((long)innerCandidate);
+                long innerNeeded = absInner;
 
-                // 内側メッセージ全体の必要長 = 4 + innerNeeded
+                int remain = OuterChunkMax - 4;
+                if (remain > 0)
+                {
+                    var rest = new byte[remain];
+                    await ReadExactAsync(ns, rest, remain, ct).ConfigureAwait(false);
+                    buffer.Write(rest, 0, remain);
+                }
+
                 while (buffer.Length < 4L + innerNeeded)
                 {
                     int? nextLenMaybe = await ReadInt32LEAsync(ns, ct).ConfigureAwait(false);
@@ -143,8 +146,8 @@ public static class LegacyCompatFraming
                     buffer.Write(tmp, 0, tmp.Length);
                 }
 
-                // 復元（解凍/非圧縮）
-                buffer.Position = 4; // 内側ヘッダの直後
+                // 復元
+                buffer.Position = 4; // 内側ヘッダ直後
                 if (innerCompressed)
                 {
                     using var def = new DeflateStream(buffer, CompressionMode.Decompress, leaveOpen: true);
@@ -161,12 +164,20 @@ public static class LegacyCompatFraming
                     return result;
                 }
             }
+            else
+            {
+                // ---- 直送(A) payload=65532 ----
+                var rest = new byte[OuterChunkMax - 4];
+                await ReadExactAsync(ns, rest, rest.Length, ct).ConfigureAwait(false);
+                var payload = new byte[OuterChunkMax];
+                Buffer.BlockCopy(peek4, 0, payload, 0, 4);
+                Buffer.BlockCopy(rest, 0, payload, 4, rest.Length);
+                return payload;
+            }
         }
 
-        // ---- 直送だったと判断（= 最初に読んだ first は内側ヘッダ=正値で、payload 長と一致）----
-        // 「内側ヘッダ（= first）」の後ろに payload を並べる直送形式：
-        // すでに payload を first バイトぶん読み込んでいるので、それがそのまま答え。
-        return firstBlock;
+        // 4) >65532 → 不正（直送ヘッダにもチャンク長にもなり得ない）
+        throw new InvalidDataException($"invalid first field {first}");
     }
 
     /// <summary>
