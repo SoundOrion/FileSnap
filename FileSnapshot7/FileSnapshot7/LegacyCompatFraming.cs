@@ -95,90 +95,84 @@ public static class LegacyCompatFraming
     {
         if (ns is null) throw new ArgumentNullException(nameof(ns));
 
-        // 先頭 4B を読む
         int? firstMaybe = await ReadInt32LEAsync(ns, ct).ConfigureAwait(false);
         if (firstMaybe is null)
             throw new EndOfStreamException("stream closed while reading first 4 bytes");
         int first = firstMaybe.Value;
 
-        // 1) first <= 0 → 直送(A)（負=圧縮、0=空）
-        // 2) 1..65531 → 直送(A)非圧縮（この実装の送信側ではチャンク開始は65532固定）
+        // --- 直送(A) 確定パス（負=圧縮/0=空/1..65531=非圧縮） ---
         if (first < OuterChunkMax)
             return await ReceiveUnchunkedAfterHeaderAsync(ns, first, ct).ConfigureAwait(false);
 
-        // 3) 65532 → 境界（直送(A) or チャンク(B)）
+        // --- 境界：first == 65532 → まず 65532B をブロックとして読む ---
         if (first == OuterChunkMax)
         {
-            var peek4 = new byte[4];
-            await ReadExactAsync(ns, peek4, 4, ct).ConfigureAwait(false);
-            int innerCandidate = BinaryPrimitives.ReadInt32LittleEndian(peek4);
-            long absInner = Math.Abs((long)innerCandidate);
+            var block = new byte[OuterChunkMax];
+            await ReadExactAsync(ns, block, block.Length, ct).ConfigureAwait(false);
 
-            if (absInner > OuterChunkMax)
+            // このブロックの先頭4Bは：
+            //   - 直送(A)：payload先頭（= 任意の4B）
+            //   - チャンク(B)：内側ヘッダ（±payloadSize）
+            if (block.Length >= 4)
             {
-                // ---- チャンク(B) 確定 ----
-                using var buffer = new MemoryStream(capacity: OuterChunkMax + 4);
-                buffer.Write(peek4, 0, 4);
+                int innerCandidate = BinaryPrimitives.ReadInt32LittleEndian(block.AsSpan(0, 4));
+                long absInner = Math.Abs((long)innerCandidate);
 
-                bool innerCompressed = innerCandidate < 0;
-                long innerNeeded = absInner;
-
-                int remain = OuterChunkMax - 4;
-                if (remain > 0)
+                // abs(inner) > 65532 のときのみチャンク化される設計なので、これで一意に判定可能
+                if (absInner > OuterChunkMax)
                 {
-                    var rest = new byte[remain];
-                    await ReadExactAsync(ns, rest, remain, ct).ConfigureAwait(false);
-                    buffer.Write(rest, 0, remain);
-                }
+                    // ---- チャンク(B) 確定：block には [内側ヘッダ(4B)] + 続き が入っている ----
+                    bool innerCompressed = innerCandidate < 0;
+                    long innerNeeded = absInner;
 
-                while (buffer.Length < 4L + innerNeeded)
-                {
-                    int? nextLenMaybe = await ReadInt32LEAsync(ns, ct).ConfigureAwait(false);
-                    if (nextLenMaybe is null)
-                        throw new EndOfStreamException("stream closed while reading frame length");
+                    using var buffer = new MemoryStream(capacity: block.Length + 64 * 1024);
+                    buffer.Write(block, 0, block.Length);
 
-                    int nextLen = nextLenMaybe.Value;
-                    if (nextLen <= 0 || nextLen > OuterChunkMax)
-                        throw new InvalidDataException($"bad outer frame length {nextLen}");
+                    // 内側メッセージ全体の必要長 = 4 + innerNeeded
+                    while (buffer.Length < 4L + innerNeeded)
+                    {
+                        int? lenMaybe = await ReadInt32LEAsync(ns, ct).ConfigureAwait(false);
+                        if (lenMaybe is null)
+                            throw new EndOfStreamException("stream closed while reading frame length");
+                        int len = lenMaybe.Value;
+                        if (len <= 0 || len > OuterChunkMax)
+                            throw new InvalidDataException($"bad outer frame length {len}");
 
-                    var tmp = new byte[nextLen];
-                    await ReadExactAsync(ns, tmp, nextLen, ct).ConfigureAwait(false);
-                    buffer.Write(tmp, 0, tmp.Length);
-                }
+                        var tmp = new byte[len];
+                        await ReadExactAsync(ns, tmp, len, ct).ConfigureAwait(false);
+                        buffer.Write(tmp, 0, tmp.Length);
+                    }
 
-                // 復元
-                buffer.Position = 4; // 内側ヘッダ直後
-                if (innerCompressed)
-                {
-                    using var def = new DeflateStream(buffer, CompressionMode.Decompress, leaveOpen: true);
-                    using var outMs = new MemoryStream();
-                    await def.CopyToAsync(outMs, ct).ConfigureAwait(false);
-                    return outMs.ToArray();
-                }
-                else
-                {
-                    var result = new byte[innerNeeded];
-                    int read = await buffer.ReadAsync(result, ct).ConfigureAwait(false);
-                    if (read != result.Length)
-                        throw new InvalidDataException("unexpected end while reading raw payload");
-                    return result;
+                    // 復元（圧縮/非圧縮）
+                    buffer.Position = 4;
+                    if (innerCompressed)
+                    {
+                        using var def = new DeflateStream(buffer, CompressionMode.Decompress, leaveOpen: true);
+                        using var outMs = new MemoryStream();
+                        await def.CopyToAsync(outMs, ct).ConfigureAwait(false);
+                        return outMs.ToArray();
+                    }
+                    else
+                    {
+                        var result = new byte[innerNeeded];
+                        int read = await buffer.ReadAsync(result, ct).ConfigureAwait(false);
+                        if (read != result.Length) throw new InvalidDataException("unexpected end while reading raw payload");
+                        return result;
+                    }
                 }
             }
-            else
-            {
-                // ---- 直送(A) payload=65532 ----
-                var rest = new byte[OuterChunkMax - 4];
-                await ReadExactAsync(ns, rest, rest.Length, ct).ConfigureAwait(false);
-                var payload = new byte[OuterChunkMax];
-                Buffer.BlockCopy(peek4, 0, payload, 0, 4);
-                Buffer.BlockCopy(rest, 0, payload, 4, rest.Length);
-                return payload;
-            }
+
+            // ---- 直送(A) 確定（payload 長 = 65532）----
+            return block;
         }
 
-        // 4) >65532 → 不正（直送ヘッダにもチャンク長にもなり得ない）
+        // --- > 65532 → これは直送(A)の内側ヘッダ（負=圧縮 or 正の大きい値） ---
+        if (first > OuterChunkMax)
+            return await ReceiveUnchunkedAfterHeaderAsync(ns, first, ct).ConfigureAwait(false);
+
         throw new InvalidDataException($"invalid first field {first}");
     }
+
 
     /// <summary>
     /// 先頭 4B が「内側ヘッダ（±payloadSize）」であることが確定している場合の受信処理。
